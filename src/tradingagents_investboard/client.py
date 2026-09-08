@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -49,9 +50,13 @@ class InvestboardClient:
             error = (body or {}).get("error") or {}
             details = error.get("details") or {}
             reason = details.get("reason") or REASON_BY_STATUS.get(response.status_code, "error")
-            raise InvestboardApiError(
-                response.status_code, reason, error.get("message") or response.text[:200]
-            )
+            message = error.get("message") or response.text[:200]
+            # A 4xx is the caller's problem to fix, and `details` is where the
+            # server says which field it objected to. Without it a validation
+            # failure reads as "422 subject_unresolvable: Invalid payload".
+            if 400 <= response.status_code < 500 and details:
+                message = f"{message} (details: {json.dumps(details, default=str)[:500]})"
+            raise InvestboardApiError(response.status_code, reason, message)
         return body.get("data")
 
     def post_run(self, payload: dict[str, Any]) -> Any:

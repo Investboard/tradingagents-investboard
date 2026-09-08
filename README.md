@@ -11,7 +11,8 @@ The analysis itself is unchanged. This package adds one HTTP post at the end of 
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.10 or newer. Check with `python3 --version`; on macOS, `brew install python@3.12` if
+  the system Python is older
 - Your own LLM provider key, the same one TradingAgents already needs
 - An Investboard account
 
@@ -29,9 +30,13 @@ The install pulls TradingAgents and LangChain, so it takes a few minutes.
 tradingagents-investboard connect
 ```
 
-This opens your browser once, you sign in to Investboard and approve access. Tokens are written to
-`~/.tradingagents/investboard/tokens.json` with owner-only permissions. The access token is short
-lived and is refreshed automatically on later runs, so you only connect once per machine.
+This prints the authorization URL and opens it in your browser, you sign in to Investboard and
+approve access. On a machine with no browser, copy the printed URL. Tokens are written to
+`~/.tradingagents/investboard/tokens.json` with owner-only permissions.
+
+You connect once per machine. An access token lives a day; when it has run out, the next command
+spends the stored refresh token at Investboard's token endpoint and writes the new pair back to the
+same file. The refresh token does not expire, so no later run needs a browser.
 
 ## Analyse
 
@@ -54,6 +59,30 @@ tradingagents-investboard replay          # post runs that could not reach Inves
 If a post fails, the run is not lost. The payload is written to
 `~/.tradingagents/investboard/outbox/` and `replay` sends it later. Posts are idempotent, so
 replaying a run that already arrived does not duplicate it.
+
+## Troubleshooting
+
+**`Error: Not connected. Run: tradingagents-investboard connect`**
+
+The machine has no usable token: it was never connected, the token file was removed, or the stored
+refresh token no longer works (you revoked the connection, or the account changed). Run `connect`
+again. `analyze` asks for the token before it starts the analysis, so this never costs you a run.
+
+**A run finished but the post did not**
+
+The payload is in `~/.tradingagents/investboard/outbox/`, one JSON file per run, and nothing has
+been lost. Run `tradingagents-investboard replay`. It reports what it sent, what Investboard
+refused, and what is still queued, and it exits 1 if anything did not go through. A network outage
+leaves every file in place, so simply run it again when the connection is back.
+
+**A rejected entry**
+
+A refusal Investboard will repeat is set aside rather than retried: a payload it cannot parse, a
+ticker it cannot resolve, a run over the size limit, a paused account, or a daily cap already
+reached. `replay` renames those to `<run id>.json.rejected` and moves on, so one bad entry cannot
+block the queue. Nothing is deleted. Delete the file when you no longer want the run; for a refusal
+that clears with time, such as a daily cap or a paused subscription, drop the `.rejected` suffix and
+run `replay` again.
 
 ## Use it from Python
 

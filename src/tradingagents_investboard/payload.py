@@ -5,46 +5,143 @@ fixed markdown shape (``**Rating**: X`` and friends, see
 ``tradingagents.agents.schemas``). We read that shape deterministically; an
 unrecognisable decision is sent as ``REVIEW`` with the raw text as summary,
 never coerced into a tradeable tier.
+
+Two parsing rules earn their keep against real model output. A field ends only
+where another *known* label begins, so a bold heading the model invents inside
+a thesis does not truncate it; and the first occurrence of a label wins, so a
+rating quoted inside a thesis cannot overwrite the real one.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 RATINGS = ("Buy", "Overweight", "Hold", "Underweight", "Sell")
 TRADER_ACTIONS = ("Buy", "Hold", "Sell")
 REPORT_MAX_CHARS = 65_536
 
-_FIELD_RE = re.compile(
-    r"\*\*(?P<label>[^*]+)\*\*:\s*(?P<value>.*?)(?=\n\s*\n\*\*|\nFINAL TRANSACTION|\Z)",
-    re.DOTALL,
+# Every label the rendered decision and trader plan can carry. The set is both
+# what we read and what ends the value before it.
+KNOWN_LABELS = (
+    "Rating",
+    "Executive Summary",
+    "Investment Thesis",
+    "Price Target",
+    "Time Horizon",
+    "Action",
+    "Reasoning",
+    "Entry Price",
+    "Stop Loss",
+    "Position Sizing",
 )
+
+_LABELS = "|".join(re.escape(label) for label in KNOWN_LABELS)
+_TERMINATOR = rf"(?=\n[ \t]*\*\*[ \t]*(?:{_LABELS})[ \t]*\*\*[ \t]*:|\n\s*FINAL TRANSACTION|\Z)"
+_FIELD_RE = re.compile(
+    rf"\*\*[ \t]*(?P<label>{_LABELS})[ \t]*\*\*[ \t]*:[ \t]*(?P<value>.*?){_TERMINATOR}",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# A leading currency marker: one symbol, or an ISO-style three-letter code.
+_CURRENCY_PREFIX_RE = re.compile(r"^(?:[$€£¥₣₹₺₩]|[A-Za-z]{3}\b)[ \t]*")
+# What is left has to be one number and nothing else: no second figure, no
+# range, no trailing prose.
+_BARE_NUMBER_RE = re.compile(r"\d[\d.,]*")
 
 
 def _fields(markdown: str) -> dict[str, str]:
-    return {
-        m.group("label").strip().lower(): m.group("value").strip()
-        for m in _FIELD_RE.finditer(markdown or "")
-    }
+    fields: dict[str, str] = {}
+    for match in _FIELD_RE.finditer(markdown or ""):
+        # setdefault, not assignment: the first occurrence of a label is the
+        # agent's own; a later one is quoted inside somebody's argument.
+        fields.setdefault(match.group("label").strip().lower(), match.group("value").strip())
+    return fields
+
+
+def _is_grouped(digits: str, separator: str) -> bool:
+    """True when ``digits`` reads as thousands grouping: 1, 1.234, 12.345.678."""
+    parts = digits.split(separator)
+    if len(parts) < 2 or not (1 <= len(parts[0]) <= 3) or not parts[0].isdigit():
+        return False
+    return all(len(part) == 3 and part.isdigit() for part in parts[1:])
+
+
+def _normalise_separators(text: str) -> str | None:
+    """Rewrite a grouped/decimal number as a plain float literal, or refuse.
+
+    Refusing matters more than guessing: reading "1,25" as 125 or 1.25 is a
+    hundredfold error in a price target, so an ambiguous grouping returns None.
+    """
+    has_dot = "." in text
+    has_comma = "," in text
+    if not has_dot and not has_comma:
+        return text
+    if has_dot and has_comma:
+        # Both present: the last one is the decimal mark, the other must group.
+        decimal = "." if text.rfind(".") > text.rfind(",") else ","
+        group = "," if decimal == "." else "."
+        head, _, tail = text.rpartition(decimal)
+        if decimal in head or not tail.isdigit() or not _is_grouped(head, group):
+            return None
+        return f"{head.replace(group, '')}.{tail}"
+    separator = "." if has_dot else ","
+    head, _, tail = text.rpartition(separator)
+    if separator in head:
+        # Several of the same separator can only be grouping.
+        return text.replace(separator, "") if _is_grouped(text, separator) else None
+    if len(tail) == 3 and _is_grouped(text, separator):
+        return text.replace(separator, "")
+    if separator == ",":
+        # "1,25" is either 1.25 or a broken group. Neither reading is safe.
+        return None
+    return text
 
 
 def _number(value: str | None) -> float | None:
-    if not value:
+    text = (value or "").strip()
+    if not text:
         return None
-    match = re.search(r"-?\d+(?:[.,]\d+)?", value)
-    if not match:
+    text = _CURRENCY_PREFIX_RE.sub("", text, count=1).strip()
+    sign = -1.0 if text.startswith("-") else 1.0
+    if text[:1] in {"+", "-"}:
+        text = text[1:].strip()
+    if not _BARE_NUMBER_RE.fullmatch(text):
+        return None
+    normalised = _normalise_separators(text)
+    if normalised is None:
         return None
     try:
-        return float(match.group(0).replace(",", "."))
+        return sign * float(normalised)
     except ValueError:
         return None
 
 
 def _clip(text: str | None) -> str:
     return (text or "")[:REPORT_MAX_CHARS]
+
+
+def _utc(moment: datetime) -> str:
+    """UTC with a Z suffix: the wire form the ingest contract asks for."""
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _heuristic_rating(markdown: str) -> str | None:
+    """The framework's own rating extractor, used only when the labels fail.
+
+    Imported inside the function so this module stays importable (and testable)
+    without the framework installed.
+    """
+    try:
+        from tradingagents.agents.utils.rating import extract_rating
+    except Exception:  # the framework is optional at import time
+        return None
+    try:
+        return extract_rating(markdown)
+    except Exception:
+        return None
 
 
 def run_id_for(ticker: str, trade_date: str, started_at: datetime) -> str:
@@ -56,12 +153,16 @@ def run_id_for(ticker: str, trade_date: str, started_at: datetime) -> str:
 
 def parse_decision(markdown: str) -> dict[str, Any]:
     fields = _fields(markdown)
-    rating = fields.get("rating", "").strip("* ")
+    rating = fields.get("rating", "").strip("* ").strip()
+    if rating not in RATINGS:
+        rating = _heuristic_rating(markdown or "") or ""
     if rating not in RATINGS:
         return {
             "rating": "REVIEW",
-            "executive_summary": _clip(markdown.strip()),
-            "investment_thesis": _clip(markdown.strip()),
+            # The raw text is kept once, as the summary. Repeating it as a
+            # thesis would dress a parse failure up as an argument.
+            "executive_summary": _clip((markdown or "").strip()),
+            "investment_thesis": "",
         }
     decision: dict[str, Any] = {
         "rating": rating,
@@ -124,8 +225,8 @@ def build_run_payload(
             "max_debate_rounds": int(config.get("max_debate_rounds") or 0),
             "max_risk_discuss_rounds": int(config.get("max_risk_discuss_rounds") or 0),
         },
-        "run_started_at": started_at.isoformat(),
-        "run_completed_at": completed_at.isoformat(),
+        "run_started_at": _utc(started_at),
+        "run_completed_at": _utc(completed_at),
         "decision": parse_decision(final_state.get("final_trade_decision") or ""),
         "reports": {
             "market": _clip(final_state.get("market_report")),

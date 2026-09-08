@@ -1,16 +1,21 @@
 """Clerk OAuth for Investboard, through the MCP Python SDK's client flow.
 
 Investboard's MCP server publishes its authorization-server metadata; the SDK
-discovers it, registers this CLI as a public PKCE client, opens the browser
-for consent and stores the tokens here. Access tokens live one day and the
-refresh token does not expire, so every run re-opens a short MCP session
-first: the SDK refreshes when needed and the stored access token is then
-handed to the REST client.
+discovers it, registers this CLI as a public PKCE client, opens the browser for
+consent and stores the tokens here. That happens once, in ``connect``.
 
-The HTTP client for that session comes from ``create_mcp_http_client``: from
-mcp 2.x the transports speak httpx2, and ``OAuthClientProvider`` is an
-``httpx2.Auth``, so a plain ``httpx.AsyncClient`` cannot carry it. The REST
-client in ``client.py`` stays on httpx.
+Later runs never open an MCP session. Access tokens live one day and the
+refresh token does not expire, so ``access_token`` reads the stored pair,
+returns the access token while it is still fresh, and otherwise exchanges the
+refresh token at the authorization server's token endpoint itself. The SDK
+keeps its expiry bookkeeping in memory, which is no help to a fresh process;
+the ``tokens_obtained_at`` stamp written beside the tokens is.
+
+The HTTP client for the ``connect`` session comes from
+``create_mcp_http_client``: from mcp 2.x the transports speak httpx2, and
+``OAuthClientProvider`` is an ``httpx2.Auth``, so a plain ``httpx.AsyncClient``
+cannot carry it. The REST client in ``client.py``, and the refresh below, stay
+on httpx.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider, TokenStorage
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
@@ -37,6 +43,10 @@ TOKEN_DIR = Path(
         "TRADINGAGENTS_INVESTBOARD_HOME", Path.home() / ".tradingagents" / "investboard"
     )
 )
+NOT_CONNECTED = "Not connected. Run: tradingagents-investboard connect"
+# Refresh a little before the server would reject the token, so a long run does
+# not start with one that expires mid-flight.
+REFRESH_LEEWAY_SECONDS = 60
 
 
 def base_url() -> str:
@@ -47,12 +57,13 @@ class FileTokenStorage(TokenStorage):
     def __init__(self, path: Path | None = None):
         self.path = path or (TOKEN_DIR / "tokens.json")
 
-    def _read(self) -> dict:
+    def read(self) -> dict:
+        """The whole token file: tokens, client registration, cached endpoint."""
         if not self.path.exists():
             return {}
         return json.loads(self.path.read_text(encoding="utf-8") or "{}")
 
-    def _write(self, data: dict) -> None:
+    def write(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # An explicit chmod, not mkdir(mode=...): that mode argument is masked
         # by the umask, and ignored outright when the directory already exists.
@@ -60,24 +71,49 @@ class FileTokenStorage(TokenStorage):
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.chmod(self.path, 0o600)
 
+    def store_tokens(self, tokens: OAuthToken) -> None:
+        """Persist a token pair and stamp when it was obtained.
+
+        The stamp is what makes expiry legible to a later process: the SDK's own
+        expiry state lives in memory and dies with the session that created it.
+        """
+        data = self.read()
+        data["tokens"] = tokens.model_dump(exclude_none=True)
+        data["tokens_obtained_at"] = time.time()
+        self.write(data)
+
     async def get_tokens(self) -> OAuthToken | None:
-        raw = self._read().get("tokens")
+        raw = self.read().get("tokens")
         return OAuthToken.model_validate(raw) if raw else None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        data = self._read()
-        data["tokens"] = tokens.model_dump(exclude_none=True)
-        data["tokens_obtained_at"] = time.time()
-        self._write(data)
+        self.store_tokens(tokens)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
-        raw = self._read().get("client")
+        raw = self.read().get("client")
         return OAuthClientInformationFull.model_validate(raw) if raw else None
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
-        data = self._read()
+        data = self.read()
         data["client"] = client_info.model_dump(exclude_none=True, mode="json")
-        self._write(data)
+        self.write(data)
+
+
+def parse_callback_query(raw_query: str) -> dict[str, str | None]:
+    """Read the authorization response out of the redirect's query string.
+
+    ``iss`` is RFC 9207. Investboard's metadata advertises
+    ``authorization_response_iss_parameter_supported``, and the SDK compares the
+    value against the discovered issuer, so dropping it here left the client
+    unable to notice a mix-up. It is carried through.
+    """
+    query = parse_qs(raw_query)
+    return {
+        "code": query.get("code", [None])[0],
+        "state": query.get("state", [None])[0],
+        "iss": query.get("iss", [None])[0],
+        "error": None if "code" in query else query.get("error", ["unknown"])[0],
+    }
 
 
 class _CallbackServer:
@@ -92,17 +128,21 @@ class _CallbackServer:
 
     def __init__(self, port: int = CALLBACK_PORT):
         self.port = port
-        self.result: dict[str, str | None] = {"code": None, "state": None, "error": None}
+        self.result: dict[str, str | None] = {
+            "code": None,
+            "state": None,
+            "iss": None,
+            "error": None,
+        }
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # http.server names its handlers this way
-                query = parse_qs(urlparse(self.path).query)
-                if "code" in query:
-                    outer.result["code"] = query["code"][0]
-                    outer.result["state"] = query.get("state", [None])[0]
+                parsed = parse_callback_query(urlparse(self.path).query)
+                if parsed["code"]:
+                    outer.result.update(parsed)
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
                     self.end_headers()
@@ -111,7 +151,7 @@ class _CallbackServer:
                         b"You can return to the terminal.</p></body></html>"
                     )
                 else:
-                    outer.result["error"] = query.get("error", ["unknown"])[0]
+                    outer.result["error"] = parsed["error"] or "unknown"
                     self.send_response(400)
                     self.end_headers()
 
@@ -124,6 +164,8 @@ class _CallbackServer:
         if self._server is not None:
             return
         self._server = HTTPServer(("127.0.0.1", self.port), self._handler)
+        # Port 0 asks the OS to pick one; record what it picked.
+        self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -142,7 +184,9 @@ class _CallbackServer:
         while time.time() < deadline:
             if self.result["code"]:
                 return AuthorizationCodeResult(
-                    code=self.result["code"], state=self.result["state"], iss=None
+                    code=self.result["code"],
+                    state=self.result["state"],
+                    iss=self.result["iss"],
                 )
             if self.result["error"]:
                 raise RuntimeError(f"Authorization failed: {self.result['error']}")
@@ -155,9 +199,12 @@ def _provider(storage: FileTokenStorage, interactive: bool) -> OAuthClientProvid
 
     async def redirect(url: str) -> None:
         if not interactive:
-            raise RuntimeError("Not connected. Run: tradingagents-investboard connect")
+            raise RuntimeError(NOT_CONNECTED)
         server.start()
-        print("Opening your browser to connect Investboard")
+        # Printed before the browser is opened: on a headless machine the open
+        # silently does nothing, and the URL is all the user has to work with.
+        print("Open this URL to connect Investboard:")
+        print(url)
         webbrowser.open(url)
 
     async def callback() -> AuthorizationCodeResult:
@@ -199,10 +246,71 @@ async def _touch_session(interactive: bool) -> OAuthToken:
 
 
 def connect() -> None:
-    """Interactive first-time connection."""
+    """Interactive first-time connection: browser consent, registration, tokens."""
     asyncio.run(_touch_session(interactive=True))
 
 
-def access_token() -> str:
-    """A fresh access token for the REST client; refreshes through the MCP session, never prompts."""
-    return asyncio.run(_touch_session(interactive=False)).access_token
+def _discover_token_endpoint(http: httpx.Client) -> str:
+    response = http.get(f"{base_url()}/.well-known/oauth-authorization-server")
+    response.raise_for_status()
+    endpoint = response.json().get("token_endpoint")
+    if not endpoint:
+        raise RuntimeError("The authorization-server metadata carries no token_endpoint")
+    return str(endpoint)
+
+
+def _refresh(storage: FileTokenStorage, data: dict, transport: httpx.BaseTransport | None) -> str:
+    tokens = data.get("tokens") or {}
+    refresh_token = tokens.get("refresh_token")
+    # A public client, registered with token_endpoint_auth_method "none": the
+    # client id identifies it and there is no secret to send.
+    client_id = (data.get("client") or {}).get("client_id")
+    if not refresh_token or not client_id:
+        raise RuntimeError(NOT_CONNECTED)
+    try:
+        with httpx.Client(timeout=httpx.Timeout(30.0), transport=transport) as http:
+            endpoint = data.get("token_endpoint") or _discover_token_endpoint(http)
+            response = http.post(
+                endpoint,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                },
+                headers={"accept": "application/json"},
+            )
+            response.raise_for_status()
+            fresh = OAuthToken.model_validate(response.json())
+    except Exception as error:
+        raise RuntimeError(NOT_CONNECTED) from error
+    # A server that does not rotate the refresh token omits it from the
+    # response; keeping the stored one is what lets the next run refresh again.
+    if fresh.refresh_token is None:
+        fresh.refresh_token = refresh_token
+    data["tokens"] = fresh.model_dump(exclude_none=True)
+    data["tokens_obtained_at"] = time.time()
+    data["token_endpoint"] = endpoint
+    storage.write(data)
+    return fresh.access_token
+
+
+def access_token(transport: httpx.BaseTransport | None = None) -> str:
+    """A usable access token, without a browser and without an MCP session.
+
+    Reads what ``connect`` stored, hands back the access token while it is still
+    fresh, and otherwise spends the refresh token. Every way of ending up
+    without a token is reported the same way, because the remedy is the same.
+    """
+    storage = FileTokenStorage()
+    data = storage.read()
+    tokens = data.get("tokens") or {}
+    stored = tokens.get("access_token")
+    if not stored:
+        raise RuntimeError(NOT_CONNECTED)
+    obtained_at = data.get("tokens_obtained_at")
+    expires_in = tokens.get("expires_in")
+    if obtained_at and expires_in:
+        expiry = float(obtained_at) + float(expires_in) - REFRESH_LEEWAY_SECONDS
+        if time.time() < expiry:
+            return str(stored)
+    return _refresh(storage, data, transport)
