@@ -77,7 +77,8 @@ def test_a_503_is_retried_three_times(outbox):
     assert len(calls) == 3
 
 
-def test_replay_sets_a_refusal_aside_and_keeps_going(outbox):
+@pytest.mark.parametrize("status", graph.PERMANENT_STATUSES)
+def test_replay_sets_a_permanent_refusal_aside_and_keeps_going(outbox, status):
     """One entry Investboard will never accept must not block the ones behind it."""
     graph.write_outbox({"framework_run_id": "run-a", "ticker": "NOPE"})
     graph.write_outbox({"framework_run_id": "run-b", "ticker": "SAP.DE"})
@@ -87,7 +88,7 @@ def test_replay_sets_a_refusal_aside_and_keeps_going(outbox):
         if payload["framework_run_id"] == "run-a":
             details = {"reason": "subject_unresolvable", "field": "ticker"}
             body = {"error": {"message": "no subject", "details": details}}
-            return httpx.Response(422, json=body)
+            return httpx.Response(status, json=body)
         return httpx.Response(201, json={"data": {"id": "stored-1"}})
 
     transport, calls = counting_transport(respond)
@@ -97,6 +98,47 @@ def test_replay_sets_a_refusal_aside_and_keeps_going(outbox):
     assert outcome == {"sent": ["run-b"], "rejected": ["run-a"], "failed": []}
     assert len(calls) == 2
     assert sorted(p.name for p in outbox.iterdir()) == ["run-a.json.rejected"]
+
+
+@pytest.mark.parametrize("status", graph.REQUEUE_STATUSES)
+def test_replay_keeps_a_requeue_refusal_in_the_queue(outbox, status):
+    """A lapsed connection, a paused subscription and a spent daily cap refuse
+    the account, not the run.
+
+    The payload is good and will be accepted once the account is, so it keeps
+    its place in the queue. Setting it aside as `.rejected` made the user
+    rename a file by hand to recover a run nothing was wrong with.
+    """
+    graph.write_outbox({"framework_run_id": "run-a"})
+    graph.write_outbox({"framework_run_id": "run-b"})
+
+    transport, calls = counting_transport(
+        lambda request: httpx.Response(status, json={"error": {"message": "not now"}})
+    )
+
+    outcome = graph.replay_outbox(transport=transport)
+
+    assert outcome == {"sent": [], "rejected": [], "failed": ["run-a"]}
+    # Not retried inside the post, and the entry behind it is not tried at all.
+    assert len(calls) == 1
+    assert sorted(p.name for p in outbox.iterdir()) == ["run-a.json", "run-b.json"]
+
+
+def test_a_second_refusal_does_not_overwrite_the_first(outbox):
+    """Two runs can carry the same id, and the outbox throws nothing away."""
+    refused = httpx.MockTransport(
+        lambda request: httpx.Response(422, json={"error": {"message": "no subject"}})
+    )
+    graph.write_outbox({"framework_run_id": "run-a", "attempt": 1})
+    graph.replay_outbox(transport=refused)
+    graph.write_outbox({"framework_run_id": "run-a", "attempt": 2})
+
+    graph.replay_outbox(transport=refused)
+
+    names = sorted(p.name for p in outbox.iterdir())
+    assert len(names) == 2
+    assert "run-a.json.rejected" in names
+    assert all(name.endswith(".rejected") for name in names)
 
 
 def test_replay_stops_on_a_transient_failure_and_leaves_the_file(outbox):

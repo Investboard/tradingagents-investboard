@@ -16,8 +16,10 @@ app = typer.Typer(
 
 # Exchange-suffixed tickers (SAP.DE), indices (^GDAXI), pairs (BTC-USD) and the
 # odd vendor form. Anything else is a typo, and a typo should not cost an hour
-# of model time before the server rejects it.
-TICKER_RE = re.compile(r"[A-Za-z0-9.^@_/-]+")
+# of model time before the server rejects it. At least one alphanumeric
+# character, since "..." and "---" name no instrument, and a ceiling no real
+# symbol comes near.
+TICKER_RE = re.compile(r"(?=.{1,64}\Z)[A-Za-z0-9.^@_/-]*[A-Za-z0-9][A-Za-z0-9.^@_/-]*")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -44,7 +46,12 @@ def _reported(command: F) -> F:
 
 
 def _fail(message: str) -> None:
-    typer.echo(message, err=True)
+    """End on stderr, the way `_reported` ends on an exception.
+
+    A failure the command saw coming reads exactly like one it did not: same
+    prefix, same stream. Stdout stays for what the command was asked to report.
+    """
+    typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=1)
 
 
@@ -55,17 +62,17 @@ def _today() -> str:
 
 def _checked_date(value: str) -> str:
     if not DATE_RE.fullmatch(value):
-        _fail(f"Error: --date must be YYYY-MM-DD, not {value!r}.")
+        _fail(f"--date must be YYYY-MM-DD, not {value!r}.")
     try:
         date.fromisoformat(value)
     except ValueError:
-        _fail(f"Error: {value!r} is not a real calendar date.")
+        _fail(f"{value!r} is not a real calendar date.")
     return value
 
 
 def _checked_ticker(value: str) -> str:
     if not TICKER_RE.fullmatch(value):
-        _fail(f"Error: {value!r} is not a usable ticker.")
+        _fail(f"{value!r} is not a usable ticker.")
     return value.upper()
 
 
@@ -118,11 +125,10 @@ def analyze(
         verdict = check["status"] if check else f"none ({skipped})"
         typer.echo(f"Stored in Investboard as {stored['id']}. Mandate check: {verdict}")
     else:
-        typer.echo(
+        _fail(
             f"Investboard post failed ({outcome.get('error')}). "
             f"Saved to {outcome.get('outbox')}; run: tradingagents-investboard replay"
         )
-        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -162,7 +168,10 @@ def replay() -> None:
     for run_id in outcome["rejected"]:
         typer.echo(f"Rejected: {run_id} (kept as .rejected, Investboard will not accept it)")
     if outcome["rejected"] or outcome["failed"]:
-        raise typer.Exit(code=1)
+        _fail(
+            "Not every run reached Investboard. A queued run is retried by the next replay; "
+            "a rejected one is kept on disk and needs you."
+        )
 
 
 if __name__ == "__main__":

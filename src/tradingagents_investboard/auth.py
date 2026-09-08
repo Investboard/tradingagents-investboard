@@ -5,7 +5,7 @@ discovers it, registers this CLI as a public PKCE client, opens the browser for
 consent and stores the tokens here. That happens once, in ``connect``.
 
 Later runs never open an MCP session. Access tokens live one day and the
-refresh token does not expire, so ``access_token`` reads the stored pair,
+refresh token is long-lived, so ``access_token`` reads the stored pair,
 returns the access token while it is still fresh, and otherwise exchanges the
 refresh token at the authorization server's token endpoint itself. The SDK
 keeps its expiry bookkeeping in memory, which is no help to a fresh process;
@@ -44,6 +44,12 @@ TOKEN_DIR = Path(
     )
 )
 NOT_CONNECTED = "Not connected. Run: tradingagents-investboard connect"
+# A refusal of the connection and a failure to ask are different problems with
+# different remedies, so they are not reported as one. Connecting again cannot
+# fix an outage, and it costs a browser round trip to find that out.
+UNREACHABLE = (
+    "Investboard could not be reached while refreshing the connection. Try again in a moment."
+)
 # Refresh a little before the server would reject the token, so a long run does
 # not start with one that expires mid-flight.
 REFRESH_LEEWAY_SECONDS = 60
@@ -164,7 +170,9 @@ class _CallbackServer:
         if self._server is not None:
             return
         self._server = HTTPServer(("127.0.0.1", self.port), self._handler)
-        # Port 0 asks the OS to pick one; record what it picked.
+        # The bound port, which is `CALLBACK_PORT` on every real connection: it
+        # has to match the redirect URI the client registered. Only the tests
+        # pass port 0 and let the OS pick, so they read back what it picked.
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -259,30 +267,54 @@ def _discover_token_endpoint(http: httpx.Client) -> str:
     return str(endpoint)
 
 
+def _is_invalid_grant(response: httpx.Response) -> bool:
+    """True when the server refused the refresh token itself.
+
+    That is the one failure ``connect`` fixes. Everything else the endpoint can
+    answer with is about the request or the server, and re-consenting does not
+    touch it.
+    """
+    if response.status_code != 400:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") == "invalid_grant"
+
+
 def _refresh(storage: FileTokenStorage, data: dict, transport: httpx.BaseTransport | None) -> str:
     tokens = data.get("tokens") or {}
     refresh_token = tokens.get("refresh_token")
-    # A public client, registered with token_endpoint_auth_method "none": the
-    # client id identifies it and there is no secret to send.
-    client_id = (data.get("client") or {}).get("client_id")
+    client = data.get("client") or {}
+    client_id = client.get("client_id")
     if not refresh_token or not client_id:
         raise RuntimeError(NOT_CONNECTED)
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    # How the client authenticates was settled at registration. This one asks
+    # to be a public PKCE client ("none"), where the client id is the whole
+    # identity, but a server may register it as `client_secret_post` instead
+    # and then refuse every exchange that arrives without the secret it issued.
+    if client.get("token_endpoint_auth_method") == "client_secret_post" and client.get(
+        "client_secret"
+    ):
+        body["client_secret"] = str(client["client_secret"])
     try:
         with httpx.Client(timeout=httpx.Timeout(30.0), transport=transport) as http:
             endpoint = data.get("token_endpoint") or _discover_token_endpoint(http)
-            response = http.post(
-                endpoint,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": client_id,
-                },
-                headers={"accept": "application/json"},
-            )
+            response = http.post(endpoint, data=body, headers={"accept": "application/json"})
             response.raise_for_status()
             fresh = OAuthToken.model_validate(response.json())
+    except httpx.HTTPStatusError as error:
+        if _is_invalid_grant(error.response):
+            raise RuntimeError(NOT_CONNECTED) from error
+        raise RuntimeError(UNREACHABLE) from error
     except Exception as error:
-        raise RuntimeError(NOT_CONNECTED) from error
+        raise RuntimeError(UNREACHABLE) from error
     # A server that does not rotate the refresh token omits it from the
     # response; keeping the stored one is what lets the next run refresh again.
     if fresh.refresh_token is None:
@@ -298,8 +330,10 @@ def access_token(transport: httpx.BaseTransport | None = None) -> str:
     """A usable access token, without a browser and without an MCP session.
 
     Reads what ``connect`` stored, hands back the access token while it is still
-    fresh, and otherwise spends the refresh token. Every way of ending up
-    without a token is reported the same way, because the remedy is the same.
+    fresh, and otherwise spends the refresh token. A missing or refused
+    connection is reported as such, because ``connect`` is the remedy; a
+    refresh that never got an answer is reported as an outage, because it is
+    not.
     """
     storage = FileTokenStorage()
     data = storage.read()

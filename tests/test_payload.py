@@ -106,9 +106,17 @@ def test_unparseable_decision_becomes_review(final_state, run_config):
 
 
 def test_a_bare_rating_line_is_read_by_the_frameworks_own_extractor():
-    """Prose the label parser cannot read is still worth a rating, not REVIEW."""
-    decision = parse_decision("Rating: Buy\n\nWe are constructive.")
+    """Prose the label parser cannot read is still worth a rating, not REVIEW.
+
+    And the rating keeps the text it was read from: a tradeable rating with an
+    empty summary is a recommendation with no reasoning behind it, which is
+    exactly what the REVIEW branch refuses to send.
+    """
+    raw = "Rating: Buy\n\nWe are constructive."
+    decision = parse_decision(raw)
     assert decision["rating"] == "Buy"
+    assert decision["executive_summary"] == raw
+    assert decision["investment_thesis"] == ""
 
 
 def test_a_bold_heading_inside_a_thesis_does_not_truncate_it():
@@ -140,12 +148,20 @@ def test_a_rating_quoted_inside_a_thesis_does_not_override_the_real_one():
     "raw,expected",
     [
         ("260.0", 260.0),
+        # A lone dot is the decimal point. `str(float)` is what wrote the
+        # number, so reading these as thousands groups made a 1.234 target
+        # arrive as 1234 and an 0.085 target as 85.
+        ("1.234", 1.234),
+        ("0.085", 0.085),
+        ("12.345", 12.345),
         ("$1,250", 1250.0),
+        ("1,234.56", 1234.56),
         ("1.234,50", 1234.5),
         ("EUR 241.5", 241.5),
         ("290", 290.0),
         # A second number in the field means we do not know which one is meant.
         ("We see 12-15% upside to 290", None),
+        ("12-15% upside to 290", None),
         # 1.25 or 125? A hundredfold error is worse than no price target.
         ("1,25", None),
         ("", None),
@@ -154,6 +170,30 @@ def test_a_rating_quoted_inside_a_thesis_does_not_override_the_real_one():
 )
 def test_number_parses_only_unambiguous_single_numbers(raw, expected):
     assert _number(raw) == expected
+
+
+@pytest.mark.parametrize("target", [1.234, 0.085, 260.0, 1250.0])
+def test_a_rendered_price_target_survives_the_round_trip(target):
+    """The convention, not the one call site: whatever the framework renders,
+    we read back unchanged.
+
+    ``render_pm_decision`` writes the target with ``str(float)``, so this is the
+    shape every real price target arrives in. A separator rule that disagrees
+    with it does not fail loudly; it stores a plausible number that is wrong by
+    a factor of a thousand.
+    """
+    from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+
+    markdown = render_pm_decision(
+        PortfolioDecision(
+            rating="Overweight",
+            executive_summary="Constructive over the next quarter.",
+            investment_thesis="Cloud revenue growth is durable.",
+            price_target=target,
+        )
+    )
+
+    assert parse_decision(markdown)["price_target"] == target
 
 
 def test_missing_trader_plan_omits_the_proposal(final_state, run_config):

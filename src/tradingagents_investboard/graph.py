@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,10 +20,20 @@ from .payload import build_run_payload
 
 OUTBOX_DIR = TOKEN_DIR / "outbox"
 
-# Refusals, not outages. Retrying them wastes the user's time and, for 429,
-# spends the daily cap. 400 belongs here: a malformed payload is malformed on
-# every attempt.
-TERMINAL_STATUSES = (400, 401, 402, 413, 422, 429)
+# Refusals, not outages. Retrying one wastes the user's time and, for 429,
+# spends the daily cap. They part company only in the outbox.
+#
+# A permanent refusal is about the payload, and the server will repeat it
+# however long we wait: it cannot parse the payload, cannot resolve the
+# subject, or the payload is over the size limit.
+PERMANENT_STATUSES = (400, 413, 422)
+# A requeue refusal is about the account, not the payload: a connection that
+# has lapsed, a paused subscription, a daily cap already spent. The payload is
+# good and will be accepted once the account is, so it must keep its place in
+# the queue rather than be set aside for the user to rename by hand.
+REQUEUE_STATUSES = (401, 402, 429)
+# Either way, a single post does not retry itself.
+NO_RETRY_STATUSES = PERMANENT_STATUSES + REQUEUE_STATUSES
 _UNSAFE_IN_FILENAME = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -44,7 +55,7 @@ def post_payload(
             try:
                 return client.post_run(payload)
             except InvestboardApiError as error:
-                if error.status in TERMINAL_STATUSES:
+                if error.status in NO_RETRY_STATUSES:
                     raise
                 if attempt == 2:
                     raise
@@ -65,6 +76,21 @@ def outbox_path_for(run_id: str) -> Path:
     return OUTBOX_DIR / f"{safe}.json"
 
 
+def _set_aside(path: Path) -> Path:
+    """Rename an entry out of the queue, without overwriting an earlier one.
+
+    Two runs of the same instrument on the same date can be refused twice, and
+    the second refusal must not silently delete the first entry: nothing in the
+    outbox is ever thrown away.
+    """
+    target = path.with_name(f"{path.name}.rejected")
+    if target.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = path.with_name(f"{path.name}.{stamp}.rejected")
+    path.rename(target)
+    return target
+
+
 def write_outbox(payload: dict[str, Any]) -> Path:
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
     # The outbox and the directory holding it both carry run payloads.
@@ -74,7 +100,9 @@ def write_outbox(payload: dict[str, Any]) -> Path:
     # Written whole, then renamed into place: a crash mid-write must not leave
     # `replay` a truncated payload to choke on. O_EXCL and 0o600 mean the file
     # is never briefly world-readable and never an existing file we adopt.
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    # A random suffix, not the pid: two writers can share a pid across a fork
+    # or a container restart, and O_EXCL would then fail on a stale temporary.
+    temporary = path.with_name(f"{path.name}.{secrets.token_hex(4)}.tmp")
     descriptor = os.open(temporary, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -89,9 +117,12 @@ def write_outbox(payload: dict[str, Any]) -> Path:
 def replay_outbox(transport: httpx.BaseTransport | None = None) -> dict[str, list[str]]:
     """Post what the outbox holds, one entry at a time.
 
-    Each entry is judged on its own: a refusal the server will repeat is set
-    aside as ``.rejected`` so it cannot block the queue for ever, while a
-    transient failure stops the run and leaves every remaining file in place.
+    Each entry is judged on its own. A refusal about the payload is permanent,
+    so the entry is set aside as ``.rejected`` and cannot block the queue for
+    ever. A refusal about the account, and any transient failure, stops the run
+    and leaves every remaining file in place: an expired connection, a paused
+    subscription and a spent daily cap all clear on their own, and asking the
+    user to rename a file afterwards is how a good run gets lost.
     """
     outcome: dict[str, list[str]] = {"sent": [], "rejected": [], "failed": []}
     if not OUTBOX_DIR.exists():
@@ -100,17 +131,18 @@ def replay_outbox(transport: httpx.BaseTransport | None = None) -> dict[str, lis
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except ValueError:
-            path.rename(path.with_name(f"{path.name}.rejected"))
+            _set_aside(path)
             outcome["rejected"].append(path.stem)
             continue
         run_id = str(payload.get("framework_run_id") or path.stem)
         try:
             post_payload(payload, transport=transport)
         except InvestboardApiError as error:
-            if error.status in TERMINAL_STATUSES:
-                path.rename(path.with_name(f"{path.name}.rejected"))
+            if error.status in PERMANENT_STATUSES:
+                _set_aside(path)
                 outcome["rejected"].append(run_id)
                 continue
+            # A requeue status, or a status we have no policy for: keep it.
             outcome["failed"].append(run_id)
             break
         except Exception:

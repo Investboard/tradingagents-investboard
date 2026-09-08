@@ -36,7 +36,7 @@ approve access. On a machine with no browser, copy the printed URL. Tokens are w
 
 You connect once per machine. An access token lives a day; when it has run out, the next command
 spends the stored refresh token at Investboard's token endpoint and writes the new pair back to the
-same file. The refresh token does not expire, so no later run needs a browser.
+same file. The refresh token is long-lived, so no later run needs a browser.
 
 ## Analyse
 
@@ -68,6 +68,11 @@ The machine has no usable token: it was never connected, the token file was remo
 refresh token no longer works (you revoked the connection, or the account changed). Run `connect`
 again. `analyze` asks for the token before it starts the analysis, so this never costs you a run.
 
+**`Error: Investboard could not be reached while refreshing the connection`**
+
+The refresh got no answer: no network, or Investboard was briefly unavailable. Your connection is
+intact and `connect` is not the remedy. Run the command again in a moment.
+
 **A run finished but the post did not**
 
 The payload is in `~/.tradingagents/investboard/outbox/`, one JSON file per run, and nothing has
@@ -75,14 +80,19 @@ been lost. Run `tradingagents-investboard replay`. It reports what it sent, what
 refused, and what is still queued, and it exits 1 if anything did not go through. A network outage
 leaves every file in place, so simply run it again when the connection is back.
 
+**A queued entry**
+
+A refusal about your account rather than the run stays in the queue: a lapsed connection, a paused
+subscription, a daily cap already reached. `replay` stops at that entry and leaves it, and every
+entry behind it, exactly where it is. Nothing to rename: clear the cause, then run `replay` again.
+
 **A rejected entry**
 
-A refusal Investboard will repeat is set aside rather than retried: a payload it cannot parse, a
-ticker it cannot resolve, a run over the size limit, a paused account, or a daily cap already
-reached. `replay` renames those to `<run id>.json.rejected` and moves on, so one bad entry cannot
-block the queue. Nothing is deleted. Delete the file when you no longer want the run; for a refusal
-that clears with time, such as a daily cap or a paused subscription, drop the `.rejected` suffix and
-run `replay` again.
+A refusal Investboard will repeat for the run itself is set aside rather than retried: a payload it
+cannot parse, a ticker it cannot resolve, a run over the size limit. `replay` renames those to
+`<run id>.json.rejected` and moves on, so one bad entry cannot block the queue. Nothing is deleted.
+Delete the file when you no longer want the run, or drop the `.rejected` suffix to put it back in
+the queue.
 
 ## Use it from Python
 

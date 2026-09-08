@@ -217,7 +217,46 @@ def test_a_kept_refresh_token_survives_a_response_that_omits_it(tmp_path, monkey
     assert stored["tokens"]["refresh_token"] == "refresh-1"
 
 
+def test_a_confidential_client_sends_the_secret_it_was_issued(tmp_path, monkeypatch):
+    """Registration settles how the client authenticates, and we have to obey it.
+
+    This CLI asks to be a public PKCE client, but a server may register it as
+    `client_secret_post` instead and then refuse every exchange that arrives
+    without the secret. The user would read that refusal as a lost connection
+    and reconnect straight into the same wall.
+    """
+    _store(
+        tmp_path,
+        monkeypatch,
+        obtained_at=time.time() - 90_000,
+        token_endpoint=TOKEN_ENDPOINT,
+        client={
+            "client_id": "client-1",
+            "client_secret": "secret-1",
+            "token_endpoint_auth_method": "client_secret_post",
+            "redirect_uris": ["http://127.0.0.1:8765/callback"],
+        },
+    )
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = dict(urllib.parse.parse_qsl(request.content.decode()))
+        return httpx.Response(
+            200, json={"access_token": "refreshed", "token_type": "Bearer", "expires_in": 86400}
+        )
+
+    assert auth.access_token(transport=httpx.MockTransport(handler)) == "refreshed"
+
+    assert seen["body"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "refresh-1",
+        "client_id": "client-1",
+        "client_secret": "secret-1",
+    }
+
+
 def test_a_failed_refresh_reads_as_not_connected(tmp_path, monkeypatch):
+    """`invalid_grant` is the one refusal `connect` fixes: the token is spent."""
     _store(
         tmp_path, monkeypatch, obtained_at=time.time() - 90_000, token_endpoint=TOKEN_ENDPOINT
     )
@@ -227,6 +266,38 @@ def test_a_failed_refresh_reads_as_not_connected(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="tradingagents-investboard connect"):
         auth.access_token(transport=httpx.MockTransport(handler))
+
+
+def _no_route(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("no route to host")
+
+
+def _server_error(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(500, text="down")
+
+
+def _another_refusal(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(400, json={"error": "invalid_request"})
+
+
+@pytest.mark.parametrize("handler", [_no_route, _server_error, _another_refusal])
+def test_a_refresh_that_got_no_answer_is_not_a_lost_connection(tmp_path, monkeypatch, handler):
+    """Everything other than the refused grant is somebody else's problem.
+
+    Reporting an outage as a lost connection sends the user through a browser
+    round trip that cannot fix it, and leaves them believing a connection that
+    still works is gone.
+    """
+    _store(
+        tmp_path, monkeypatch, obtained_at=time.time() - 90_000, token_endpoint=TOKEN_ENDPOINT
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        auth.access_token(transport=httpx.MockTransport(handler))
+
+    assert str(excinfo.value) == auth.UNREACHABLE
+    # And it does not send the user to the browser to fix somebody else's outage.
+    assert "tradingagents-investboard connect" not in str(excinfo.value)
 
 
 def test_no_stored_token_reads_as_not_connected(tmp_path, monkeypatch):

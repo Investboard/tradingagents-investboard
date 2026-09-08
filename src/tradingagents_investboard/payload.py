@@ -2,9 +2,10 @@
 
 The framework's decision-making agents render structured output back to a
 fixed markdown shape (``**Rating**: X`` and friends, see
-``tradingagents.agents.schemas``). We read that shape deterministically; an
-unrecognisable decision is sent as ``REVIEW`` with the raw text as summary,
-never coerced into a tradeable tier.
+``tradingagents.agents.schemas``). We read that shape deterministically; a
+decision whose labels we cannot read keeps its raw text as the summary, whether
+the rating comes from the framework's own extractor or is ``REVIEW``. Nothing
+unreadable is coerced into a tradeable tier.
 
 Two parsing rules earn their keep against real model output. A field ends only
 where another *known* label begins, so a bold heading the model invents inside
@@ -72,8 +73,13 @@ def _is_grouped(digits: str, separator: str) -> bool:
 def _normalise_separators(text: str) -> str | None:
     """Rewrite a grouped/decimal number as a plain float literal, or refuse.
 
-    Refusing matters more than guessing: reading "1,25" as 125 or 1.25 is a
-    hundredfold error in a price target, so an ambiguous grouping returns None.
+    A lone dot is a decimal point. The framework renders a price target with
+    ``str(float)``, so that is the only reading it can have; treating it as a
+    thousands group made every sub-ten price a thousandfold error.
+
+    A lone comma carries no such guarantee, and there refusing beats guessing:
+    "1,25" is either 1.25 or a broken group, and a hundredfold error in a price
+    target is worse than no price target at all.
     """
     has_dot = "." in text
     has_comma = "," in text
@@ -88,16 +94,14 @@ def _normalise_separators(text: str) -> str | None:
             return None
         return f"{head.replace(group, '')}.{tail}"
     separator = "." if has_dot else ","
-    head, _, tail = text.rpartition(separator)
-    if separator in head:
+    if text.count(separator) > 1:
         # Several of the same separator can only be grouping.
         return text.replace(separator, "") if _is_grouped(text, separator) else None
-    if len(tail) == 3 and _is_grouped(text, separator):
-        return text.replace(separator, "")
-    if separator == ",":
-        # "1,25" is either 1.25 or a broken group. Neither reading is safe.
-        return None
-    return text
+    if separator == ".":
+        return text if text.partition(".")[2].isdigit() else None
+    # One comma: a thousands group is the only unambiguous reading it has, and
+    # that is 1 to 3 digits ahead of exactly 3 behind, nothing else.
+    return text.replace(",", "") if _is_grouped(text, ",") else None
 
 
 def _number(value: str | None) -> float | None:
@@ -155,12 +159,14 @@ def parse_decision(markdown: str) -> dict[str, Any]:
     fields = _fields(markdown)
     rating = fields.get("rating", "").strip("* ").strip()
     if rating not in RATINGS:
-        rating = _heuristic_rating(markdown or "") or ""
-    if rating not in RATINGS:
+        # The labels failed. The framework's own extractor may still read a
+        # rating out of the prose, but that prose is then the only reasoning
+        # there is, and a tradeable rating must never travel without it. Both
+        # endings therefore keep the raw text once, as the summary: repeating
+        # it as a thesis would dress a parse failure up as an argument.
+        heuristic = _heuristic_rating(markdown or "")
         return {
-            "rating": "REVIEW",
-            # The raw text is kept once, as the summary. Repeating it as a
-            # thesis would dress a parse failure up as an argument.
+            "rating": heuristic if heuristic in RATINGS else "REVIEW",
             "executive_summary": _clip((markdown or "").strip()),
             "investment_thesis": "",
         }

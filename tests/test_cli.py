@@ -30,8 +30,19 @@ def test_a_misshaped_date_is_refused(connected):
     assert "YYYY-MM-DD" in result.output
 
 
-def test_a_ticker_that_is_not_a_ticker_is_refused(connected):
-    result = runner.invoke(cli.app, ["analyze", "SAP DE; rm -rf /"])
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        "SAP DE; rm -rf /",
+        # Punctuation is allowed inside a symbol, but it never is the symbol.
+        "...",
+        "___",
+        # And no instrument is named by 65 characters.
+        "A" * 65,
+    ],
+)
+def test_a_ticker_that_is_not_a_ticker_is_refused(connected, ticker):
+    result = runner.invoke(cli.app, ["analyze", ticker])
 
     assert result.exit_code == 1
     assert "not a usable ticker" in result.output
@@ -68,6 +79,8 @@ def test_a_failure_is_one_line_not_a_traceback(monkeypatch):
 
 
 def test_replay_reports_the_counts_and_fails_when_anything_was_rejected(monkeypatch):
+    """The counts are the report and stay on stdout; the failure is an error and
+    goes where every other error goes, so a pipeline sees it."""
     import tradingagents_investboard.graph as graph
 
     monkeypatch.setattr(
@@ -77,8 +90,32 @@ def test_replay_reports_the_counts_and_fails_when_anything_was_rejected(monkeypa
     result = runner.invoke(cli.app, ["replay"])
 
     assert result.exit_code == 1
-    assert "Sent 1, rejected 1, still queued 0." in result.output
-    assert "Rejected: b" in result.output
+    assert "Sent 1, rejected 1, still queued 0." in result.stdout
+    assert "Rejected: b" in result.stdout
+    assert result.stderr.startswith("Error: Not every run reached Investboard")
+
+
+def test_a_failed_post_reports_the_outbox_as_an_error(connected, monkeypatch):
+    """The run itself succeeded, so the rating is a result and belongs on
+    stdout; the post did not, and that is an error like any other."""
+    import tradingagents_investboard.graph as graph
+
+    class FakeGraph:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def propagate(self, ticker, analysis_date, asset_type="stock"):
+            outcome = {"stored": None, "outbox": "/outbox/run-1.json", "error": "503 down"}
+            return {"investboard": outcome}, "Overweight"
+
+    monkeypatch.setattr(graph, "InvestboardTradingAgentsGraph", FakeGraph)
+
+    result = runner.invoke(cli.app, ["analyze", "SAP.DE", "--date", "2026-09-08"])
+
+    assert result.exit_code == 1
+    assert result.stdout.strip() == "Agent rating: Overweight"
+    assert result.stderr.startswith("Error: Investboard post failed (503 down).")
+    assert "/outbox/run-1.json" in result.stderr
 
 
 def test_replay_of_an_empty_outbox_succeeds(monkeypatch):
