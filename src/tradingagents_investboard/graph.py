@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,8 +50,11 @@ def post_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def write_outbox(payload: dict[str, Any]) -> Path:
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(OUTBOX_DIR, 0o700)
     path = OUTBOX_DIR / f"{payload['framework_run_id']}.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # The entry is the whole run payload, so it stays owner-only.
+    os.chmod(path, 0o600)
     return path
 
 

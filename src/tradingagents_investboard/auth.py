@@ -54,6 +54,9 @@ class FileTokenStorage(TokenStorage):
 
     def _write(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # An explicit chmod, not mkdir(mode=...): that mode argument is masked
+        # by the umask, and ignored outright when the directory already exists.
+        os.chmod(self.path.parent, 0o700)
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.chmod(self.path, 0o600)
 

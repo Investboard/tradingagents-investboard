@@ -28,7 +28,7 @@ def connect() -> None:
 @app.command()
 def analyze(
     ticker: str = typer.Argument(..., help="Exchange-suffixed ticker, e.g. SAP.DE or AAPL"),
-    analysis_date: str = typer.Option(_today(), "--date", help="YYYY-MM-DD"),
+    analysis_date: str | None = typer.Option(None, "--date", help="YYYY-MM-DD"),
     asset_type: str = typer.Option("stock", "--asset-type", help="stock or crypto"),
     checkpoint: bool = typer.Option(
         False, "--checkpoint", help="Enable LangGraph checkpoint resume"
@@ -39,6 +39,10 @@ def analyze(
 
     from .graph import InvestboardTradingAgentsGraph
 
+    # Resolved per invocation. An option default is evaluated once, when the
+    # module is imported, so a long-lived process would keep the date it
+    # started with.
+    analysis_date = analysis_date or _today()
     config = DEFAULT_CONFIG.copy()
     config["checkpoint_enabled"] = checkpoint
     graph = InvestboardTradingAgentsGraph(debug=False, config=config)
