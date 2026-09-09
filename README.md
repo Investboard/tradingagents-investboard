@@ -7,7 +7,9 @@ TradingAgents is a multi-agent research framework that you run on your own machi
 keys. This package wraps it so that when a run finishes, the completed analysis is posted to your
 Investboard account, where it is stored next to your portfolio and checked against your mandate.
 
-The analysis itself is unchanged. This package adds one HTTP post at the end of a run.
+The analysis itself stays the framework's. This package adds three things to it: your own data
+behind the framework's core data reads, your policy and your position in every agent's context, and
+one HTTP post at the end of the run.
 
 ## Requirements
 
@@ -44,6 +46,8 @@ same file. The refresh token is long-lived, so no later run needs a browser.
 tradingagents-investboard analyze SAP.DE
 tradingagents-investboard analyze AAPL --date 2026-09-08
 tradingagents-investboard analyze BTC-USD --asset-type crypto
+tradingagents-investboard analyze NVDA --register           # research one you do not hold
+tradingagents-investboard analyze SAP.DE --vendor default   # the framework's own data vendors
 ```
 
 The run prints the agent rating and then confirms what Investboard stored, including the mandate
@@ -60,6 +64,62 @@ If a post fails, the run is not lost. The payload is written to
 `~/.tradingagents/investboard/outbox/` and `replay` sends it later. Posts are idempotent, so
 replaying a run that already arrived does not duplicate it.
 
+## Data
+
+By default (`--vendor investboard`) the framework's core data categories are served by your
+Investboard account instead of by its own vendors:
+
+- daily price history (OHLCV) for the window an agent asks for
+- the technical indicators, computed on your machine with `stockstats` from that price history,
+  which is why there is no separate indicator read
+- company fundamentals: profile, trailing-twelve-month ratios and key metrics
+- income statement, balance sheet and cash flow, annual or quarterly
+- company news over a date window
+- insider transactions over a date window
+
+The reads are scoped to instruments you already hold, watch, or registered. Anything else is
+refused, and the refusal names registration as the remedy. To research an instrument outside that
+scope, register it first:
+
+```bash
+tradingagents-investboard analyze NVDA --register
+```
+
+Registration is idempotent: a second one reports the instrument as already registered. Investboard
+allows twenty registrations and 2,000 data reads per UTC day.
+
+Nothing dated after the analysis date is served where the read carries a date: the price history,
+the news window, the dated fundamentals rows and the statement periods all stop there, so a run
+dated in the past does not read a later filing, a later session or later news. Two exceptions are
+named rather than hidden. The company profile and the trailing-twelve-month ratios carry no date
+of their own, so they are current values, and each line says so where it is served for a past
+date. Insider transactions are the one read the framework asks for with no date at all, so they
+cover the twelve months up to today rather than up to the analysis date.
+
+What Investboard does not serve, and what serves it instead:
+
+- global news comes from the framework's own vendor, which is why the `news_data` category is the
+  chain `investboard,yfinance` rather than `investboard` alone
+- macroeconomic data (FRED) and prediction markets (Polymarket) stay on the framework's vendors,
+  untouched by this package
+- the retail-sentiment blocks (StockTwits, Reddit) are fetched by the framework itself, not through
+  a vendor at all
+- three framework calls bypass vendor routing and read yfinance directly: its verified market
+  snapshot, the instrument identity lookup, and the realised returns its reflection layer reads
+  after the fact
+
+`--vendor default` leaves every category on the framework's own vendors, which is the way to
+compare a run against the framework's unmodified data. The scope rule still applies to it: the
+position block below is read at the start of every run, whichever vendor serves the data.
+
+Either way, every analyst, researcher and manager in the run reads two blocks appended to the
+framework's instrument context: your investment policy (`investing.md`, as Investboard composed
+it) and your position in the instrument, per portfolio, with quantity, weight, cost basis and
+market value, the weight of your whole household, and the mandate band for the asset class where
+your mandate sets one. Nothing in those blocks is computed here: the numbers are the ones
+Investboard holds, on the date it states. An owner with no policy on file is told so in one line
+and the run continues.
+
 ## Troubleshooting
 
 **`Error: Not connected. Run: tradingagents-investboard connect`**
@@ -72,6 +132,13 @@ again. `analyze` asks for the token before it starts the analysis, so this never
 
 The refresh got no answer: no network, or Investboard was briefly unavailable. Your connection is
 intact and `connect` is not the remedy. Run the command again in a moment.
+
+**An instrument outside your scope (`subject_out_of_scope`)**
+
+The instrument is not one you hold, not on a watchlist and not registered, so Investboard serves
+neither data nor a position for it. The position block is read before the first agent runs, so this
+costs you no model time. Either add the instrument to a watchlist in Investboard, or run `analyze`
+again with `--register`.
 
 **A run finished but the post did not**
 
@@ -107,7 +174,29 @@ print(signal, final_state["investboard"])
 ```
 
 `InvestboardTradingAgentsGraph` is a subclass of `TradingAgentsGraph` with the same behaviour, plus
-the post. The result of the post is available under `final_state["investboard"]`.
+the post and the two context blocks. The result of the post is available under
+`final_state["investboard"]`.
+
+That run reads the framework's own data vendors, because nothing pointed them elsewhere. To read
+Investboard data as `analyze` does, import the vendor module, which registers it, and name it in a
+copy of the vendor mapping rather than in the framework's own:
+
+```python
+# Importing the module is what registers the vendor with the framework.
+from tradingagents_investboard import vendor  # noqa: F401
+
+config = DEFAULT_CONFIG.copy()
+config["data_vendors"] = dict(DEFAULT_CONFIG["data_vendors"])
+config["data_vendors"].update(
+    {
+        "core_stock_apis": "investboard",
+        "technical_indicators": "investboard",
+        "fundamental_data": "investboard",
+        "news_data": "investboard,yfinance",
+    }
+)
+graph = InvestboardTradingAgentsGraph(debug=False, config=config)
+```
 
 ## What Investboard receives
 
@@ -130,7 +219,9 @@ It is never coerced into a tradeable rating.
 - the agent prompts and the framework's internal reasoning traffic
 - the market data the framework pulls while it works
 
-Only the finished run described above is posted, and only to your own Investboard account.
+Only the finished run described above is posted, and only to your own Investboard account. The
+data reads go the other way: they ask Investboard for one instrument by ticker, with the date
+window and, for a statement, the period, and the answer comes back to your machine.
 
 ## Configuration
 

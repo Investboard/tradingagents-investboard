@@ -22,6 +22,11 @@ app = typer.Typer(
 TICKER_RE = re.compile(r"(?=.{1,64}\Z)[A-Za-z0-9.^@_/-]*[A-Za-z0-9][A-Za-z0-9.^@_/-]*")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+# What `--vendor` accepts. `investboard` points the framework's core data
+# categories at this package; `default` leaves the framework's own vendors
+# exactly as they are, so a run can be compared against them.
+VENDORS = ("investboard", "default")
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -95,25 +100,71 @@ def analyze(
     checkpoint: bool = typer.Option(
         False, "--checkpoint", help="Enable LangGraph checkpoint resume"
     ),
+    vendor: str = typer.Option(
+        "investboard",
+        "--vendor",
+        help="Data vendor for the core categories: investboard (default) or "
+        "default (the framework's own).",
+    ),
+    register: bool = typer.Option(
+        False,
+        "--register",
+        help="Register the ticker as a research subject first, so the data reads are in scope.",
+    ),
 ) -> None:
     """Run TradingAgents and post the result to Investboard."""
-    from .auth import access_token
+    from .auth import access_token, base_url
 
     # Resolved per invocation. An option default is evaluated once, when the
     # module is imported, so a long-lived process would keep the date it
     # started with.
     analysis_date = _checked_date(analysis_date or _today())
     ticker = _checked_ticker(ticker)
+    # Refused beside the other arguments rather than at the config below: a
+    # typo would otherwise spend a registration against the daily cap first.
+    if vendor not in VENDORS:
+        _fail(f"Unknown vendor {vendor}; use {' or '.join(VENDORS)}")
     # Asked for before the first token is spent: an expired connection found
     # after the analysis would cost the whole run.
     access_token()
+
+    if register:
+        from .client import InvestboardClient
+
+        client = InvestboardClient(base_url(), access_token())
+        try:
+            registration = client.register_subject(ticker)
+        finally:
+            client.close()
+        # The server answers the second registration of one instrument with
+        # the stored row and `created: false`; say so, rather than let it read
+        # as another one spent against the daily cap.
+        again = "" if (registration or {}).get("created") else " (already registered)"
+        typer.echo(f"Registered {ticker}{again}")
 
     from tradingagents.default_config import DEFAULT_CONFIG
 
     from .graph import InvestboardTradingAgentsGraph
 
     config = DEFAULT_CONFIG.copy()
+    # A shallow copy shares the vendor dict with the module default; copy it
+    # too, or every later run in this process inherits this one's choice.
+    config["data_vendors"] = dict(DEFAULT_CONFIG.get("data_vendors", {}))
     config["checkpoint_enabled"] = checkpoint
+    if vendor == "investboard":
+        from . import vendor as _investboard_vendor  # noqa: F401  (registers the vendor)
+
+        config["data_vendors"].update(
+            {
+                "core_stock_apis": "investboard",
+                "technical_indicators": "investboard",
+                "fundamental_data": "investboard",
+                # get_global_news is not ours, and a category naming us alone
+                # would raise for it; the chain serves it from yfinance, and
+                # falls back there on a rate limit from us.
+                "news_data": "investboard,yfinance",
+            }
+        )
     graph = InvestboardTradingAgentsGraph(debug=False, config=config)
     final_state, signal = graph.propagate(ticker, analysis_date, asset_type=asset_type)
     typer.echo(f"Agent rating: {signal}")

@@ -1,9 +1,25 @@
+import sys
+
 import pytest
 from typer.testing import CliRunner
 
 from tradingagents_investboard import cli
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def framework_vendors(monkeypatch):
+    """Every test meets the framework's vendor defaults as the framework left them.
+
+    `analyze` configures a copy, and the test below says so. The claim would be
+    vacuous without this: an earlier test in the file runs `analyze` too, so a
+    leak from it would already have written the same choice into the module
+    default, and the comparison would then hold for the wrong reason.
+    """
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    monkeypatch.setitem(DEFAULT_CONFIG, "data_vendors", dict(DEFAULT_CONFIG["data_vendors"]))
 
 
 @pytest.fixture
@@ -129,3 +145,138 @@ def test_replay_of_an_empty_outbox_succeeds(monkeypatch):
 
     assert result.exit_code == 0
     assert "Outbox is empty." in result.output
+
+
+def test_analyze_points_the_core_categories_at_investboard_without_touching_the_default(
+    connected, monkeypatch
+):
+    """The run configures a copy: a second run in the same process, and every
+    other consumer of the framework's default, must be unaffected."""
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    captured: dict = {}
+
+    class FakeGraph:
+        def __init__(self, debug=False, config=None):
+            captured["config"] = config
+
+        def propagate(self, ticker, trade_date, asset_type="stock"):
+            stored = {"id": "run-1", "check": None, "check_skipped_reason": "no_sizing"}
+            return {"investboard": {"stored": stored}}, "Hold"
+
+    monkeypatch.setattr("tradingagents_investboard.graph.InvestboardTradingAgentsGraph", FakeGraph)
+    before = dict(DEFAULT_CONFIG["data_vendors"])
+
+    result = runner.invoke(cli.app, ["analyze", "SAP.DE", "--date", "2026-09-08"])
+
+    assert result.exit_code == 0, result.output
+    vendors = captured["config"]["data_vendors"]
+    assert vendors["core_stock_apis"] == "investboard"
+    assert vendors["technical_indicators"] == "investboard"
+    assert vendors["fundamental_data"] == "investboard"
+    # get_global_news is not ours, and a category of "investboard" alone would
+    # raise for it, so the chain names yfinance behind us.
+    assert vendors["news_data"] == "investboard,yfinance"
+    assert DEFAULT_CONFIG["data_vendors"] == before
+    assert "investboard" in sys.modules.get("tradingagents.dataflows.interface").VENDOR_LIST
+
+
+def test_analyze_keeps_the_framework_vendors_on_request(connected, monkeypatch):
+    captured: dict = {}
+
+    class FakeGraph:
+        def __init__(self, debug=False, config=None):
+            captured["config"] = config
+
+        def propagate(self, ticker, trade_date, asset_type="stock"):
+            stored = {"id": "run-1", "check": None, "check_skipped_reason": None}
+            return {"investboard": {"stored": stored}}, "Hold"
+
+    monkeypatch.setattr("tradingagents_investboard.graph.InvestboardTradingAgentsGraph", FakeGraph)
+
+    result = runner.invoke(
+        cli.app, ["analyze", "SAP.DE", "--date", "2026-09-08", "--vendor", "default"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"]["data_vendors"]["core_stock_apis"] != "investboard"
+
+
+def test_an_unknown_vendor_is_refused_before_the_analysis(connected, monkeypatch):
+    """A typo must not run the whole analysis on the framework's own vendors."""
+
+    class FakeGraph:
+        def __init__(self, debug=False, config=None):
+            raise AssertionError("the graph must not be built for an unknown vendor")
+
+    monkeypatch.setattr("tradingagents_investboard.graph.InvestboardTradingAgentsGraph", FakeGraph)
+
+    result = runner.invoke(
+        cli.app, ["analyze", "SAP.DE", "--date", "2026-09-08", "--vendor", "yfinance"]
+    )
+
+    assert result.exit_code == 1
+    assert "Unknown vendor yfinance" in result.stderr
+
+
+def test_analyze_registers_the_subject_first_when_asked(connected, monkeypatch):
+    registered: list[str] = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def register_subject(self, ticker):
+            registered.append(ticker)
+            return {"created": True}
+
+        def close(self):
+            pass
+
+    class FakeGraph:
+        def __init__(self, debug=False, config=None):
+            pass
+
+        def propagate(self, ticker, trade_date, asset_type="stock"):
+            stored = {"id": "run-1", "check": None, "check_skipped_reason": None}
+            return {"investboard": {"stored": stored}}, "Hold"
+
+    monkeypatch.setattr("tradingagents_investboard.client.InvestboardClient", FakeClient)
+    monkeypatch.setattr("tradingagents_investboard.graph.InvestboardTradingAgentsGraph", FakeGraph)
+
+    result = runner.invoke(cli.app, ["analyze", "SAP.DE", "--date", "2026-09-08", "--register"])
+
+    assert result.exit_code == 0, result.output
+    assert registered == ["SAP.DE"]
+    assert "Registered SAP.DE" in result.output
+
+
+def test_a_second_registration_says_so(connected, monkeypatch):
+    """The server answers 200 with created: false; the user should not read
+    that as a fresh registration against the daily cap."""
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def register_subject(self, ticker):
+            return {"created": False}
+
+        def close(self):
+            pass
+
+    class FakeGraph:
+        def __init__(self, debug=False, config=None):
+            pass
+
+        def propagate(self, ticker, trade_date, asset_type="stock"):
+            stored = {"id": "run-1", "check": None, "check_skipped_reason": None}
+            return {"investboard": {"stored": stored}}, "Hold"
+
+    monkeypatch.setattr("tradingagents_investboard.client.InvestboardClient", FakeClient)
+    monkeypatch.setattr("tradingagents_investboard.graph.InvestboardTradingAgentsGraph", FakeGraph)
+
+    result = runner.invoke(cli.app, ["analyze", "SAP.DE", "--date", "2026-09-08", "--register"])
+
+    assert result.exit_code == 0, result.output
+    assert "Registered SAP.DE (already registered)" in result.output
