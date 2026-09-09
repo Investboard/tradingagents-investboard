@@ -488,7 +488,7 @@ def test_the_day_the_server_has_not_served_yet_is_not_called_a_market_closure(se
 
     lines = vendor.get_indicators("SAP.DE", "close_10_ema", "2026-09-09", 6).splitlines()
 
-    assert "2026-09-09: N/A: after the last completed session (2026-09-08)" in lines
+    assert "2026-09-09: N/A: after the last session served (2026-09-08)" in lines
     assert "2026-09-09: N/A: Not a trading day (weekend or holiday)" not in lines
     # A day inside the served window with no row is still the market being shut.
     assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines

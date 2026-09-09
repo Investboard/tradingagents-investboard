@@ -147,9 +147,15 @@ def render_position_block(block: dict[str, Any]) -> str:
         lines.append(f"{UNMEASURED_HOUSEHOLD_WEIGHT}{household}.")
     band = block.get("band")
     if band and block.get("asset_class"):
+        # Not the book the header quotes. The server measures the band's share
+        # over the core priced holdings with the satellite sleeve excluded,
+        # which is the denominator its own mandate check uses; the household
+        # weight above spans the whole priced book, sleeve included. Called a
+        # household share here, the one mandate would read two ways.
         lines.append(
-            f"Asset class {block['asset_class']}: {band['current_pct']}% of the household "
-            f"as of {block['as_of']}, mandate band {band['min_pct']}% to {band['max_pct']}%."
+            f"Asset class {block['asset_class']}: {band['current_pct']}% of the core book "
+            f"(satellite sleeve excluded) as of {block['as_of']}, "
+            f"mandate band {band['min_pct']}% to {band['max_pct']}%."
         )
     return "\n".join(lines)
 

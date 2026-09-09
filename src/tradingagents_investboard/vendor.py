@@ -245,8 +245,12 @@ WARMUP_NOTE = (
 # The server pulls its `to` back to the last completed UTC day, so on a default
 # run the analysis date itself is served by no row however busily the market is
 # trading. Reported under the closure sentence below, that reads as a holiday
-# the market never had, so a day past the last row served says what it is.
-UNSERVED_LINE = "N/A: after the last completed session ({last})"
+# the market never had, so a day past the last row served says what it is. The
+# line names the last session served, which is the whole of what is known here:
+# on stale or delisted history the market has completed sessions the server did
+# not send, and calling that row the last completed one would say something
+# about the market that this package cannot see.
+UNSERVED_LINE = "N/A: after the last session served ({last})"
 
 # A null cell is not blanked. A missing volume among valid rows is skipped by
 # the rolling sums rather than propagated, so the VWMA of that session and the

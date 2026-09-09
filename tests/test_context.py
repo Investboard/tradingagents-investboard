@@ -75,10 +75,16 @@ def test_the_position_block_describes_the_holding_in_plain_sentences():
         "cost basis 12050.00 EUR, first acquired 2024-03-01." in block
     )
     assert "20.0% of the household" in block
-    assert (
-        "Asset class stocks: 50.0% of the household as of 2026-09-09T08:00:00.000Z, "
-        "mandate band 40.0% to 70.0%." in block
+    # The band and the household weight are measured over different books: the
+    # band over the core priced book with the satellite sleeve excluded, which
+    # is the denominator the server's own mandate check uses, and the weight
+    # over the whole priced book, sleeve included. The band line names its own.
+    band_line = next(line for line in block.splitlines() if line.startswith("Asset class"))
+    assert band_line == (
+        "Asset class stocks: 50.0% of the core book (satellite sleeve excluded) "
+        "as of 2026-09-09T08:00:00.000Z, mandate band 40.0% to 70.0%."
     )
+    assert "of the household" not in band_line
     assert "as of 2026-09-09T08:00:00.000Z" in block
 
 
@@ -148,6 +154,28 @@ def test_a_household_weight_the_server_could_not_measure_is_said_not_printed():
     # The rows the server did serve are still rendered under a header of their own.
     assert "The owner holds SAP.DE (as of 2026-09-09T08:00:00.000Z):" in held
     assert "Depot A: 100 units" in held
+
+
+def test_a_holding_with_no_row_in_a_book_with_no_weight_says_both():
+    """Both absences at once, the case the held-with-no-row branch is written for.
+
+    The server sends a holding whose value it could not measure as held with no
+    row, and where nothing in the household carried a countable value the
+    household weight arrives as null beside it. Both sentences then run: the
+    block says the instrument is held, says the weight it could not measure,
+    prints no `None`, and has no row to list.
+    """
+    block = context.render_position_block(
+        {**POSITION, "portfolios": [], "household_weight_pct": None}
+    )
+
+    assert "None" not in block
+    assert "The owner holds SAP.DE, but no valued position" in block
+    assert (
+        "The household weight could not be measured: no holding in the household "
+        "carried a countable value." in block
+    )
+    assert not [line for line in block.splitlines() if line.startswith("- ")]
 
 
 def test_a_weight_is_quoted_with_the_book_it_was_measured_over():
