@@ -76,7 +76,8 @@ def test_the_position_block_describes_the_holding_in_plain_sentences():
     )
     assert "20.0% of the household" in block
     assert (
-        "Asset class stocks: 50.0% of the household today, mandate band 40.0% to 70.0%." in block
+        "Asset class stocks: 50.0% of the household as of 2026-09-09T08:00:00.000Z, "
+        "mandate band 40.0% to 70.0%." in block
     )
     assert "as of 2026-09-09T08:00:00.000Z" in block
 
@@ -100,8 +101,41 @@ def test_a_money_field_the_server_left_out_is_named_not_invented():
     row = {**POSITION["portfolios"][0], "cost_basis_native_cents": None, "first_acquired_at": None}
     block = context.render_position_block({**POSITION, "portfolios": [row]})
 
-    assert "cost basis no cost basis on file." in block
+    assert "cost basis not on file." in block
+    assert "no cost basis on file" not in block
     assert "first acquired" not in block
+
+
+def test_a_holding_the_server_could_not_value_says_so():
+    """`held` with no row is a state the server states deliberately.
+
+    `buildPositionBlock` reports a holding whose value could not be measured as
+    held with no row, rather than as not held or as worth nothing, and its
+    household weight is then 0 because the weights count priced holdings only.
+    Rendering the header for that block leaves a colon with nothing under it
+    and asserts a 0% weight the owner does not have.
+    """
+    block = context.render_position_block(
+        {**POSITION, "portfolios": [], "household_weight_pct": 0.0}
+    )
+
+    assert "The owner holds SAP.DE, but no valued position" in block
+    assert not block.splitlines()[0].endswith(":")
+    # The header form, weight and dangling colon and all, is what must not run.
+    assert "The owner holds SAP.DE (" not in block
+    assert "(0.0% of the household" not in block
+
+
+def test_the_freshness_claim_is_the_servers_date_never_the_word_today():
+    """The block quotes the server's `as_of`; it never dates anything itself."""
+    held = context.render_position_block(POSITION)
+    not_held = context.render_position_block({**POSITION, "held": False, "portfolios": []})
+
+    assert "today" not in held
+    assert "today" not in not_held
+    # The not-held path carries no other date, so the asset-class line is where
+    # the block says when it was measured.
+    assert "as of 2026-09-09T08:00:00.000Z" in not_held
 
 
 def test_the_blocks_are_fetched_and_joined_after_the_framework_context():
@@ -153,3 +187,36 @@ def test_a_404_that_does_not_say_no_policy_is_an_ordinary_refusal(reason):
     with pytest.raises(InvestboardApiError) as raised:
         context.instrument_context_blocks(client_for(handler), "SAP.DE")
     assert raised.value.status == 404
+
+
+@pytest.mark.parametrize(
+    ("failing", "named"),
+    [("/context/policy", "investment policy"), ("/context/position", "position")],
+    ids=["the policy read", "the position read"],
+)
+def test_a_read_that_never_completed_names_investboard_the_read_and_the_remedy(failing, named):
+    """A transport failure is the one failure with no server message of its own.
+
+    Every refusal arrives with the server's sentence and, for an out-of-scope
+    subject, its hint. A dropped connection raises `httpx.ConnectError`, which
+    is not an `InvestboardApiError`, so without this it reaches the CLI as
+    `Error: All connection attempts failed` and names neither Investboard, nor
+    which read failed, nor what the user should do.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failing in request.url.path:
+            raise httpx.ConnectError("All connection attempts failed", request=request)
+        body = POLICY if request.url.path.endswith("/context/policy") else POSITION
+        return httpx.Response(200, json={"data": body, "error": None, "meta": {}})
+
+    with pytest.raises(RuntimeError) as raised:
+        context.instrument_context_blocks(client_for(handler), "SAP.DE")
+
+    message = str(raised.value)
+    assert "Investboard" in message
+    assert named in message
+    assert "run the analysis again" in message
+    # The original failure stays attached: the sentence says what to do, the
+    # cause says what httpx saw.
+    assert isinstance(raised.value.__cause__, httpx.TransportError)

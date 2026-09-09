@@ -163,6 +163,15 @@ class InvestboardTradingAgentsGraph(TradingAgentsGraph):
         The framework calls this once at the start of a run and threads the
         result to every agent, so one client is built here and closed again
         rather than held: these two reads are the only ones it serves.
+
+        The base method is fail-open by design, and this override deliberately
+        is not. Its identity lookup returns ``{}`` when yfinance cannot answer,
+        so the run continues on ticker-only context rather than failing before
+        analysis starts. A missing mandate is not the same kind of gap: a
+        mandate-blind run is not a degraded run, it is a run whose report the
+        user will read as mandate-checked. So a policy or position read that
+        cannot be served stops the run here, rather than dropping the owner's
+        mandate out of every agent's context without saying so.
         """
         base = super().resolve_instrument_context(ticker, asset_type)
         client = InvestboardClient(base_url(), access_token())

@@ -9,37 +9,54 @@ sentences the agents can quote.
 
 The two say different kinds of thing, and the wording keeps them apart: the
 policy is what the owner declared, the position is what the books measure on a
-stated date. Neither is advice, and nothing here is computed. Every number is
-the server's, rendered in the currency the server named it in; a field the
-server left out is said in words rather than filled with a zero.
+stated date. Neither is advice, and no figure is derived here: the only
+arithmetic is the division that renders the server's integer cents as an
+amount. Every number is the server's, in the currency the server named it in,
+and every date is the server's too.
+
+A money amount the server omitted is said in words rather than filled with a
+zero. Of the fields this module renders, the position contract makes only the
+cost basis, the first-acquired date, the asset class and its band nullable, so
+nothing else needs that treatment: quantity, the two weights and the market
+value are required, and are rendered as they arrive.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from .client import InvestboardApiError, InvestboardClient
 
 NO_POLICY_NOTE = (
     "No investment policy is on file for the owner; no mandate check will run on this run."
 )
+NOT_ON_FILE = "not on file"
 
 
-def _money(cents: int | None, currency: str | None, missing: str) -> str:
+def _money(cents: int | None, currency: str | None) -> str:
     """A cents integer as an amount in the currency the server named for it.
 
     The currency travels with the amount because the two money fields are not
     in the same one: market value is in the household's base currency and cost
     basis in the currency the lot was bought in. Rendering either without its
     own label would invite an agent to net them.
+
+    An absence is the same two words for both, so the sentence reads "market
+    value not on file" rather than saying the field's own name back to itself.
     """
     if cents is None or currency is None:
-        return missing
+        return NOT_ON_FILE
     return f"{cents / 100:.2f} {currency}"
 
 
 def render_policy_block(document: dict[str, Any]) -> str:
-    """The owner's investing.md, verbatim, under one sentence of framing."""
+    """The owner's investing.md under one sentence of framing.
+
+    The document's own text is unchanged but for the trailing whitespace this
+    strips, so the block ends on the last line the owner wrote.
+    """
     return (
         f"Investment policy of the owner (investing.md schema {document['schema_version']}, "
         f"composed {document['composed_at']}). The policy binds the trader and the portfolio "
@@ -49,32 +66,39 @@ def render_policy_block(document: dict[str, Any]) -> str:
 
 
 def render_position_block(block: dict[str, Any]) -> str:
-    """What the owner actually holds, as measured on the server's ``as_of`` date."""
+    """What the owner actually holds, as measured on the server's ``as_of`` date.
+
+    The block asserts no freshness of its own: the line that reports the asset
+    class against its band quotes the server's ``as_of`` rather than saying
+    "today", which was the one claim this module used to make for itself.
+    """
     ticker = block["subject"]["ticker"]
     lines: list[str] = []
     if not block.get("held"):
         lines.append(f"The owner does not hold {ticker}. Any proposal is a new position.")
+    elif not block.get("portfolios"):
+        # The server reports a holding whose value it could not measure as held
+        # with no row, rather than as not held or as worth nothing, and the
+        # household weight counts priced holdings only, so it arrives as 0.
+        # Rendering the ordinary header here would state that 0 as the owner's
+        # weight and then leave the colon with nothing under it.
+        lines.append(
+            f"The owner holds {ticker}, but no valued position for it could be measured, "
+            f"so this block states no quantity, weight or amount for it."
+        )
     else:
         lines.append(
             f"The owner holds {ticker} ({block['household_weight_pct']}% of the household, "
             f"as of {block['as_of']}):"
         )
-        for row in block.get("portfolios", []):
+        for row in block["portfolios"]:
             acquired = (
                 f", first acquired {row['first_acquired_at'][:10]}"
                 if row.get("first_acquired_at")
                 else ""
             )
-            market_value = _money(
-                row.get("market_value_base_cents"),
-                row.get("base_currency"),
-                "no market value on file",
-            )
-            cost_basis = _money(
-                row.get("cost_basis_native_cents"),
-                row.get("cost_basis_currency"),
-                "no cost basis on file",
-            )
+            market_value = _money(row.get("market_value_base_cents"), row.get("base_currency"))
+            cost_basis = _money(row.get("cost_basis_native_cents"), row.get("cost_basis_currency"))
             lines.append(
                 f"- {row['portfolio_name']}: {row['quantity']} units, "
                 f"{row['weight_pct_of_portfolio']}% of that portfolio, "
@@ -83,10 +107,26 @@ def render_position_block(block: dict[str, Any]) -> str:
     band = block.get("band")
     if band and block.get("asset_class"):
         lines.append(
-            f"Asset class {block['asset_class']}: {band['current_pct']}% of the household today, "
-            f"mandate band {band['min_pct']}% to {band['max_pct']}%."
+            f"Asset class {block['asset_class']}: {band['current_pct']}% of the household "
+            f"as of {block['as_of']}, mandate band {band['min_pct']}% to {band['max_pct']}%."
         )
     return "\n".join(lines)
+
+
+def _transport_failure(read: str, error: httpx.TransportError) -> RuntimeError:
+    """A read that never completed, said as a sentence rather than httpx's phrase.
+
+    Every refusal on this path arrives carrying the server's own message, and
+    an out-of-scope subject carries its hint as well, so a dropped connection
+    is the one abort with nothing in it for the reader. Left alone it reaches
+    the CLI as "Error: All connection attempts failed", which names neither
+    Investboard, nor which of the two reads failed, nor what to do about it.
+    """
+    return RuntimeError(
+        f"Investboard: the {read} read did not complete: {error}. "
+        f"No refusal came back, so this is the connection rather than the account: "
+        f"wait for it to return and run the analysis again."
+    )
 
 
 def instrument_context_blocks(client: InvestboardClient, ticker: str) -> str:
@@ -103,6 +143,14 @@ def instrument_context_blocks(client: InvestboardClient, ticker: str) -> str:
     An instrument outside the data scope is raised with the server's hint,
     because every data read that follows would refuse the same way; the CLI
     prints the next step.
+
+    A transport failure is named here rather than by routing these two reads
+    through ``_session._call``. That seam exists to translate a refusal into
+    the framework's vendor taxonomy so the chain can serve the call from
+    another provider, and it would turn the deliberate 403 abort above into a
+    ``VendorNotConfiguredError`` the chain treats as one vendor being
+    misconfigured. These two reads have no other provider, so they translate
+    the one error the server never speaks for, and nothing else.
     """
     try:
         policy = render_policy_block(client.get_policy())
@@ -110,5 +158,10 @@ def instrument_context_blocks(client: InvestboardClient, ticker: str) -> str:
         if error.reason != "no_policy":
             raise
         policy = NO_POLICY_NOTE
-    position = render_position_block(client.get_position(ticker))
+    except httpx.TransportError as error:
+        raise _transport_failure("investment policy", error) from error
+    try:
+        position = render_position_block(client.get_position(ticker))
+    except httpx.TransportError as error:
+        raise _transport_failure("position", error) from error
     return f"\n\n{policy}\n\n{position}"
