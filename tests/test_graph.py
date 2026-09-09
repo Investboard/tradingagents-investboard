@@ -157,3 +157,40 @@ def test_replay_stops_on_a_transient_failure_and_leaves_the_file(outbox):
 
 def test_replay_of_an_empty_outbox_reports_nothing(outbox):
     assert graph.replay_outbox() == {"sent": [], "rejected": [], "failed": []}
+
+
+def test_the_instrument_context_carries_the_two_blocks(monkeypatch):
+    """The framework's paragraph first, then the owner's policy and position.
+
+    The base method is patched on the framework class the override calls
+    through ``super()``, so no yfinance lookup runs; ``__new__`` skips the
+    eager LLM construction in ``__init__``, which this test must not run.
+    """
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    from tradingagents_investboard import context as context_module
+
+    seen: dict[str, object] = {}
+
+    def blocks(client, ticker):
+        seen["client"] = client
+        seen["ticker"] = ticker
+        return "\n\nPOLICY\n\nPOSITION"
+
+    monkeypatch.setattr(graph, "access_token", lambda *args, **kwargs: "tok")
+    monkeypatch.setattr(graph, "base_url", lambda: "https://app.example")
+    monkeypatch.setattr(
+        TradingAgentsGraph,
+        "resolve_instrument_context",
+        lambda self, ticker, asset_type="stock": f"The instrument to analyze is `{ticker}`.",
+    )
+    monkeypatch.setattr(context_module, "instrument_context_blocks", blocks)
+
+    instance = graph.InvestboardTradingAgentsGraph.__new__(graph.InvestboardTradingAgentsGraph)
+    text = instance.resolve_instrument_context("SAP.DE")
+
+    assert text == "The instrument to analyze is `SAP.DE`.\n\nPOLICY\n\nPOSITION"
+    assert seen["ticker"] == "SAP.DE"
+    # The client holds a connection pool and is used once, so the run must not
+    # leave it open behind the graph.
+    assert seen["client"].is_closed

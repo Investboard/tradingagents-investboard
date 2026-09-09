@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
+from . import context
 from .auth import TOKEN_DIR, access_token, base_url
 from .client import InvestboardApiError, InvestboardClient
 from .payload import build_run_payload
@@ -155,6 +156,20 @@ def replay_outbox(transport: httpx.BaseTransport | None = None) -> dict[str, lis
 
 class InvestboardTradingAgentsGraph(TradingAgentsGraph):
     """Same graph, plus one post to Investboard after each completed run."""
+
+    def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
+        """The framework's paragraph, then the owner's policy and position.
+
+        The framework calls this once at the start of a run and threads the
+        result to every agent, so one client is built here and closed again
+        rather than held: these two reads are the only ones it serves.
+        """
+        base = super().resolve_instrument_context(ticker, asset_type)
+        client = InvestboardClient(base_url(), access_token())
+        try:
+            return base + context.instrument_context_blocks(client, ticker)
+        finally:
+            client.close()
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         started_at = datetime.now(timezone.utc)
