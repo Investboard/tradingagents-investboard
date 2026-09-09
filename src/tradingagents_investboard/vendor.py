@@ -26,11 +26,21 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from stockstats import dft_windows, wrap
+from stockstats import wrap
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.interface import VENDOR_LIST, VENDOR_METHODS
 
 from ._session import _call
+
+try:
+    from stockstats import dft_windows as _stockstats_dft_windows
+except ImportError:  # pragma: no cover - a 0.6.x the pin permits but that lacks it
+    # `dft_windows` is undocumented in 0.6.8 and the dependency is pinned
+    # `>=0.6,<1`, so a permitted resolution could not carry it. Imported at
+    # module scope it would then fail this whole module, and with it the CLI
+    # that imports it for the registration side effect. The fallback below
+    # keeps the warm-up floors rather than silently losing them.
+    _stockstats_dft_windows = None
 
 VENDOR_NAME = "investboard"
 
@@ -93,13 +103,44 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     return text
 
 
+SESSION_DATE_FORMAT = "%Y-%m-%d"
+
+
+def _session_days(column: pd.Series) -> pd.Series:
+    """The Date column as the calendar days the server wrote, or a refusal.
+
+    The server's Date is a bare ``YYYY-MM-DD`` calendar day by contract (its
+    bar schema types it as Zod's ``.date()``, and the CSV writer emits that
+    string unchanged), and the whole render rests on it: sessions are keyed by
+    ``.date()``. Anything wider re-dates them. Read with ``utc=True``, a
+    Frankfurt session stamped ``2026-01-12T00:00:00+01:00`` normalises to
+    ``2026-01-11T23:00Z``, whose date is the Sunday: every session shifts back
+    a day, the Monday the market traded prints "not a trading day" and the
+    Sunday it did not prints a number. That is the exact lie the holiday
+    branch exists to prevent.
+
+    So the format is pinned, which also removes the mixed-offset ``ValueError``
+    ``utc=True`` was added for: a column of bare days has no offsets to mix. A
+    stamped row is refused rather than moved, because moving it correctly
+    needs the exchange's own timezone and neither this package nor the payload
+    carries one: the date of the stamp's local part is right only where the
+    stamp is exchange-local and wrong where it is already UTC, so normalising
+    would trade one silent mis-dating for another.
+    """
+    parsed = pd.to_datetime(column, format=SESSION_DATE_FORMAT, errors="coerce")
+    if parsed.isna().any():
+        offending = column[parsed.isna()].astype(str).tolist()[:3]
+        raise ValueError(
+            "Investboard: the OHLCV Date column must be a bare YYYY-MM-DD calendar day; "
+            f"refusing rather than re-dating {offending}"
+        )
+    return parsed
+
+
 def _frame_from_csv(text: str) -> pd.DataFrame:
     body = _split_csv(text)[1]
     frame = pd.read_csv(io.StringIO(body))
-    # `utc=True` because the window always spans a DST change: offset-bearing
-    # server timestamps would otherwise be mixed offsets, which pandas refuses
-    # with a ValueError that no translation here would catch.
-    frame["Date"] = pd.to_datetime(frame["Date"], utc=True)
+    frame["Date"] = _session_days(frame["Date"])
     frame = frame.set_index("Date").sort_index()
     frame.columns = [column.lower() for column in frame.columns]
     return frame
@@ -189,24 +230,100 @@ CLAMP_NOTE = (
     "read can warm up."
 )
 
+# The margins above are thin, so the mask can reach past the warm-up and into
+# the reported window: a market printing under about 243 sessions a year, or a
+# seven-day instrument whose oldest rows the server dropped. `close_200_sma`
+# over a 275-day look-back is the worst of them, and about 74 reported days
+# then read N/A where the framework's yfinance path prints numbers. Both
+# blanked states print the same "N/A", so without this the reader cannot tell
+# "the history behind it is short" from "the value could not be computed".
+WARMUP_NOTE = (
+    "Note: the warm-up reaches into this window: N/A on its {oldest} means the history there "
+    "is shorter than the indicator needs, not that the value could not be computed."
+)
+
+# A null cell is not blanked. A missing volume among valid rows is skipped by
+# the rolling sums rather than propagated, so the VWMA of that session and the
+# thirteen after it is computed from fewer rows and still printed as a number.
+# Blanking on any null would over-mask every indicator that never reads the
+# missing column, and a per-indicator input map would guess at stockstats'
+# internals rather than read them, so the gaps are counted and declared.
+INCOMPLETE_NOTE = (
+    "Note: the served history has {gaps} with a price or volume cell missing; values within "
+    "one window of such a session are computed from fewer rows than the window names."
+)
+
+_OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def _incomplete_sessions(frame: pd.DataFrame) -> int:
+    """Served sessions missing any one of the OHLCV cells."""
+    columns = [column for column in _OHLCV_COLUMNS if column in frame.columns]
+    return int(frame[columns].isna().any(axis=1).sum()) if columns else 0
+
+
+# stockstats' own defaults for the named indicators this vendor supports, as
+# it holds them in 0.6.8. Read only where the `dft_windows` import above found
+# nothing, so a resolution without that helper keeps the warm-up floors rather
+# than dropping every indicator to the row-0 mask.
+_FALLBACK_WINDOWS = {
+    "macd": "12,26,9",
+    "boll": "20",
+    "rsi": "14",
+    "atr": "14",
+    "vwma": "14",
+    "mfi": "14",
+}
+
+
+def _default_windows(name: str) -> str | None:
+    if _stockstats_dft_windows is not None:
+        return _stockstats_dft_windows(name)
+    return _FALLBACK_WINDOWS.get(name)
+
+
+def _largest_window(windows: str) -> int | None:
+    """The longest period in a stockstats default, which may be a comma tuple."""
+    numbers = [int(part) for part in windows.split(",") if part.strip().isdigit()]
+    return max(numbers) if numbers else None
+
 
 def _warmup_rows(indicator: str) -> int | None:
     """The rows an indicator needs before its first value means anything.
 
     stockstats encodes the window in the name where the caller chose one
     (``close_200_sma``), and carries a default for the named ones, which is
-    where ``boll_ub`` gets the 20 of its band. An indicator whose default is
-    several numbers, the MACD triple among them, has no single window, so it
-    gets none rather than a guess.
+    where ``boll_ub`` gets the 20 of its band.
+
+    A default of several numbers is read as its largest rather than skipped.
+    ``dft_windows("macd")`` is the string ``"12,26,9"``, and MACD is defined as
+    the difference of a 12 and a 26 period EMA: it is not a MACD before 26
+    rows, so 26 is a definition and not a guess. ``macds`` and ``macdh`` are
+    built from that line and carry no default of their own, so they inherit
+    its floor through the trailing-character strip. The signal line's own
+    9-period smoothing sits on top of the 26 and is not counted here, which
+    makes this a floor rather than the full warm-up.
     """
     for segment in indicator.split("_"):
         if segment.isdigit():
             return int(segment)
-    for name in (indicator, indicator.rpartition("_")[0]):
-        windows = dft_windows(name) if name else None
-        if windows is not None and windows.isdigit():
-            return int(windows)
+    for name in (indicator, indicator.rpartition("_")[0], indicator[:-1]):
+        windows = _default_windows(name) if name else None
+        largest = _largest_window(windows) if windows else None
+        if largest is not None:
+            return largest
     return None
+
+
+def _warmup_span(indicator: str) -> int:
+    """The leading rows the warm-up blanks: the window bar its last row.
+
+    At least one whatever the indicator, the ones with no derivable window
+    included: row 0 is seeded by a single session, so no reported value may
+    rest on it.
+    """
+    window = _warmup_rows(indicator)
+    return max(window - 1, 1) if window else 1
 
 
 def _with_warmup_blanked(frame: pd.DataFrame, indicator: str) -> pd.Series:
@@ -217,14 +334,27 @@ def _with_warmup_blanked(frame: pd.DataFrame, indicator: str) -> pd.Series:
     number where the honest answer is "not known", and the framework's own
     yfinance path, which loads five years, would answer differently for the
     same symbol and day. Blanking the first ``window - 1`` rows sends the gap
-    to the N/A branch instead. Row 0 is blanked whatever the indicator, the
-    ones with no derivable window included: it is seeded by a single session,
-    so no reported value may rest on it.
+    to the N/A branch instead.
     """
     series = frame[indicator].copy()
-    window = _warmup_rows(indicator)
-    series.iloc[: max(window - 1, 1) if window else 1] = float("nan")
+    series.iloc[: _warmup_span(indicator)] = float("nan")
     return series
+
+
+def _warmup_reached_note(
+    frame: pd.DataFrame, indicator: str, first: date, end: date
+) -> str | None:
+    """The note for a warm-up that ran past the history and into the window.
+
+    The blanked rows are the oldest the frame holds, so a blanked row dated on
+    or after the first reported day is a reported day the mask took.
+    """
+    masked = [index.date() for index in frame.index[: _warmup_span(indicator)]]
+    count = sum(1 for day in masked if first <= day <= end)
+    if not count:
+        return None
+    oldest = "oldest session" if count == 1 else f"{count} oldest sessions"
+    return WARMUP_NOTE.format(oldest=oldest)
 
 
 def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: int = 30) -> str:
@@ -240,7 +370,10 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
     end = date.fromisoformat(curr_date)
     start = end - timedelta(days=look_back_days + WARMUP_CALENDAR_DAYS)
     text = get_stock_data(symbol, start.isoformat(), end.isoformat())
-    frame = wrap(_frame_from_csv(text))
+    served = _frame_from_csv(text)
+    # Counted before the wrap, which adds the computed columns to the frame.
+    incomplete = _incomplete_sessions(served)
+    frame = wrap(served)
     series = _with_warmup_blanked(frame, indicator)
     by_day = {index.date(): value for index, value in series.items()}
     lines = []
@@ -257,13 +390,24 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
         else:
             # `.10g` rather than `.6g`: the framework's own path renders
             # `str(value)`, and an exponent where it prints digits reads as a
-            # different number to an agent comparing the two.
+            # different number to an agent comparing the two. `.10g` widens
+            # the range over which that holds; it does not remove the
+            # exponent. It still switches to one below 1e-4, so a sub-penny
+            # value renders `1.2345e-05`. The claim is decimal digits for
+            # values from 1e-4 up to the tenth significant figure, which is
+            # every price and average an equity instrument prints.
             lines.append(f"{day.isoformat()}: {float(by_day[day]):.10g}")
         day -= timedelta(days=1)
     header = f"## {indicator} values from {first.isoformat()} to {curr_date}:"
     description = SUPPORTED_INDICATORS[indicator]
     if _parse_csv_header(text).get("Truncated", "").lower() == "true":
         notes.append(TRUNCATION_NOTE)
+    reached = _warmup_reached_note(frame, indicator, first, end)
+    if reached:
+        notes.append(reached)
+    if incomplete:
+        gaps = "1 session" if incomplete == 1 else f"{incomplete} sessions"
+        notes.append(INCOMPLETE_NOTE.format(gaps=gaps))
     if notes:
         description = "\n".join([*notes, description])
     return f"{header}\n\n" + "\n".join(lines) + f"\n\n{description}"
@@ -318,18 +462,33 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
     ]
     if latest.get("date"):
         lines.append(f"Key metrics as of: {latest['date']}")
+    # Whether each block is as of the analysis date rather than today's value.
+    # `point_in_time` is the server's claim block by block, and its
+    # `key_metrics` flag means "these rows were cut at `as_of`", not "these
+    # were restated to today": the web side sets the three as one literal, and
+    # `key_metrics` is the true one precisely because those rows are cut by
+    # `as_of`. The undated blocks are the provider's current values and the
+    # note is the whole truth about them.
+    #
+    # `key_metrics` does not read that flag, because this renderer cuts the
+    # rows again against `curr_date` above: a dated key metric is as of that
+    # date by construction whichever way the flag reads, and printing the note
+    # as well would put "as of 2025-12-31" and "current values, not as of
+    # 2026-09-08" beside each other about one number, where one of the two has
+    # to be false. An undated row is the one key metric nothing here can
+    # bound, there is no "as of" line for it, and the note is then true.
+    as_of_bound = {
+        "profile": bool(point_in_time.get("profile", False)),
+        "ratios_ttm": bool(point_in_time.get("ratios_ttm", False)),
+        "key_metrics": bool(latest.get("date")),
+    }
     rendered = 0
     for label, block, field in _FUNDAMENTAL_LABELS:
         value = blocks[block].get(field)
         if value is None:
             continue
         note = ""
-        # Say so where the number is today's, so the agent never reads a
-        # current value as the value on the analysis date. The server's own
-        # flag decides, block by block: the undated ones (`profile`,
-        # `ratios_ttm`) are the usual case, but a `key_metrics` the server did
-        # not bound is the same claim about a different block.
-        if curr_date and not point_in_time.get(block, False):
+        if curr_date and not as_of_bound[block]:
             note = f" (current values, not as of {curr_date})"
         lines.append(f"{label}: {value}{note}")
         rendered += 1

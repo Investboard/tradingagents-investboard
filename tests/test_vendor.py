@@ -68,14 +68,19 @@ def sessions_csv(
     truncated: str | None = None,
     base: float = 100.0,
     volumes: dict[int, str] | None = None,
+    stamp: str | None = None,
 ) -> str:
     """The server's OHLCV CSV over ``days``, one row a session.
 
     ``volumes`` overrides the volume of individual rows by index, which is how
-    a single gap among valid rows is expressed.
+    a single gap among valid rows is expressed. ``stamp`` writes each Date as a
+    midnight timestamp carrying that offset instead of the bare calendar day
+    the server's contract emits: a fixture of bare dates cannot catch a parser
+    that re-dates a session, because there is nothing in it to re-date.
     """
+    written = [f"{day.isoformat()}T00:00:00{stamp}" if stamp else day.isoformat() for day in days]
     rows = "\n".join(
-        f"{day.isoformat()},{base + i},{base + 1 + i},{base - 1 + i},{base + 0.5 + i},"
+        f"{written[i]},{base + i},{base + 1 + i},{base - 1 + i},{base + 0.5 + i},"
         f"{(volumes or {}).get(i, volume)}"
         for i, day in enumerate(days)
     )
@@ -244,16 +249,44 @@ def test_key_metrics_dated_after_the_analysis_date_are_not_the_latest(served):
     assert "2026-12-31" not in text
 
 
-def test_key_metrics_the_server_did_not_bound_carry_the_current_values_note(served):
+def test_a_dated_key_metric_is_said_to_be_as_of_and_not_also_called_current(served):
+    # `point_in_time.key_metrics` is the server's word for "these rows were
+    # cut at as_of", not "these were restated to today": the web side sets the
+    # three flags as one literal and its key_metrics is true precisely because
+    # the rows are cut by as_of. This renderer cuts them again against
+    # `curr_date`, so a dated key metric is as-of correct whichever way the
+    # flag reads, and printing "as of 2025-12-31" beside "current values, not
+    # as of 2026-09-08" about one number says one false thing.
     served(
         lambda r: envelope(
             fundamentals(
                 [{"date": "2025-12-31", "eps": 4.5}],
+                {"profile": False, "key_metrics": False, "ratios_ttm": False},
+            )
+        )
+    )
+    text = vendor.get_fundamentals("SAP.DE", "2026-09-08")
+    assert "Key metrics as of: 2025-12-31" in text
+    assert "EPS: 4.5\n" in text + "\n"
+    assert "EPS: 4.5 (current values" not in text
+    # The undated blocks are the provider's current values, and still say so.
+    assert "Name: SAP SE (current values, not as of 2026-09-08)" in text
+    assert "PE Ratio (TTM): 30.5 (current values, not as of 2026-09-08)" in text
+
+
+def test_a_key_metric_with_no_date_cannot_be_bounded_and_says_so(served):
+    # Nothing here can date this row to the analysis date, so there is no
+    # "as of" line to contradict and the note is the one true line about it.
+    served(
+        lambda r: envelope(
+            fundamentals(
+                [{"eps": 4.5}],
                 {"profile": True, "key_metrics": False, "ratios_ttm": True},
             )
         )
     )
     text = vendor.get_fundamentals("SAP.DE", "2026-09-08")
+    assert "Key metrics as of:" not in text
     assert "EPS: 4.5 (current values, not as of 2026-09-08)" in text
     # The blocks the server did bound say nothing.
     assert "Name: SAP SE\n" in text + "\n"
@@ -382,18 +415,20 @@ def test_refusals_map_to_the_framework_errors(served, status, reason, expected):
     with pytest.raises(expected) as raised:
         vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
     assert "the server refused the read" in str(raised.value)
-    if expected is VendorNotConfiguredError:
-        # The reason is the word the CLI turns into a next step, and it is not
-        # the message: it survives only if this branch names it.
-        assert reason in str(raised.value)
+    # The reason is the word the CLI turns into a next step, and it is not the
+    # message: without it a cap and an outage are the same sentence to a user.
+    # Once, though: `_unwrap` already folds `details` into the message, so a
+    # fixed prefix would print it beside itself.
+    assert str(raised.value).count(reason) == 1
     if reason == "subject_out_of_scope":
         assert "register it" in str(raised.value)
 
 
 def test_a_traded_day_without_a_computed_value_reads_na_not_a_holiday(served):
-    # Three sessions, so the first has no standard deviation behind it and
-    # `boll_ub` cannot be computed on it. That day traded, so the framework's
-    # holiday sentence would be a lie about the market; "N/A" is the truth.
+    # Three sessions against a band whose middle is a 20 SMA, so the warm-up
+    # mask blanks all three and none of them has a value to print. Those days
+    # traded, so the framework's holiday sentence would be a lie about the
+    # market; "N/A" is the truth, and the two must not collapse into one.
     days = trading_days(date(2026, 9, 8), 3)
     served(lambda r: csv_response(sessions_csv(days)))
     lines = vendor.get_indicators("SAP.DE", "boll_ub", "2026-09-08", 6).splitlines()
@@ -417,10 +452,133 @@ def test_a_frame_too_short_for_the_200_sma_reports_the_gap_not_a_plausible_numbe
     assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
 
 
+def test_a_session_stamped_with_an_offset_is_refused_rather_than_re_dated(served):
+    # The server's Date is a bare calendar day by contract, and the whole
+    # render rests on that: sessions are keyed by `.date()`. Parsed with
+    # `utc=True`, a Frankfurt session stamped `2026-01-12T00:00:00+01:00`
+    # normalises to `2026-01-11T23:00Z`, whose date is the Sunday, so every
+    # session shifts back a day and a Monday SAP.DE traded prints the
+    # framework's holiday sentence: the exact lie that branch exists to
+    # prevent. Placing a stamped row on the right day would need the
+    # exchange's timezone, which nothing here carries, so it is refused.
+    days = trading_days(date(2026, 1, 16), 40)
+    served(lambda r: csv_response(sessions_csv(days, stamp="+01:00")))
+    with pytest.raises(ValueError) as raised:
+        vendor.get_indicators("SAP.DE", "close_10_ema", "2026-01-16", 5)
+    assert "YYYY-MM-DD" in str(raised.value)
+    # The same sessions as the server writes them: the Monday keeps its own
+    # date, and nothing in the window reads as a market closure it was not.
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", "close_10_ema", "2026-01-16", 5).splitlines()
+    monday = next(line for line in lines if line.startswith("2026-01-12: "))
+    assert "N/A" not in monday
+
+
+@pytest.mark.parametrize("indicator", ["macd", "macds", "macdh"])
+def test_the_macd_family_is_na_until_its_slow_ema_is_covered(served, indicator):
+    # MACD is the difference of a 12 and a 26 period EMA, so it is not a MACD
+    # before 26 rows, and the signal and the histogram are built from that
+    # line. On three sessions stockstats still prints a number for the newest
+    # two, computed from a 26-period EMA holding three rows: a plausible
+    # number a reader cannot tell from a real one.
+    days = trading_days(date(2026, 9, 8), 3)
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", indicator, "2026-09-08", 6).splitlines()
+    traded = [line for line in lines if line[:10] in {"2026-09-04", "2026-09-07", "2026-09-08"}]
+    assert traded == ["2026-09-08: N/A", "2026-09-07: N/A", "2026-09-04: N/A"]
+
+
+@pytest.mark.parametrize("indicator", ["macd", "macds", "macdh"])
+def test_the_macd_family_prints_once_its_slow_ema_is_covered(served, indicator):
+    # The floor is a floor, not a blackout: sixty sessions cover the 26 rows
+    # the line needs, so the reported days carry numbers again.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", indicator, "2026-09-08", 3).splitlines()
+    assert all("N/A" not in line for line in lines if line.startswith("2026-09-08: "))
+
+
+def test_a_warm_up_that_reaches_into_the_reported_window_says_so(served):
+    # Sixty sessions against a 200 SMA: every reported day sits inside the
+    # mask and prints N/A where the framework's yfinance path, which loads
+    # five years, prints numbers for all of them. Without a note the reader
+    # cannot tell "the history behind it is short" from "the value could not
+    # be computed", which is the distinction the whole render is built on.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days)))
+    text = vendor.get_indicators("SAP.DE", "close_200_sma", "2026-09-08", 5)
+    assert "the warm-up reaches into this window" in text
+    # Sep 3, 4, 7 and 8: the sessions the window reports, all of them masked.
+    assert "N/A on its 4 oldest sessions" in text
+    assert text.rstrip().endswith(vendor.SUPPORTED_INDICATORS["close_200_sma"])
+    # A window the warm-up clears entirely says nothing: the same sixty
+    # sessions cover a 10 EMA with room to spare.
+    covered = vendor.get_indicators("SAP.DE", "close_10_ema", "2026-09-08", 5)
+    assert "the warm-up reaches into this window" not in covered
+
+
+def test_an_incomplete_served_session_is_declared_rather_than_masked(served):
+    # A single null volume among valid rows is skipped by the rolling sums
+    # rather than propagated, so the VWMA of that day and the thirteen after
+    # it is computed from fewer rows and still printed. Blanking on any null
+    # would over-mask and a per-indicator input map would guess at stockstats'
+    # internals, so the gap is counted and said instead.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days, volumes={59: ""})))
+    text = vendor.get_indicators("SAP.DE", "vwma", "2026-09-08", 5)
+    assert "the served history has 1 session with a price or volume cell missing" in text
+    assert "computed from fewer rows" in text
+    assert text.rstrip().endswith(vendor.SUPPORTED_INDICATORS["vwma"])
+    served(lambda r: csv_response(sessions_csv(days, volumes={40: "", 59: ""})))
+    assert "has 2 sessions with a price or volume cell missing" in vendor.get_indicators(
+        "SAP.DE", "vwma", "2026-09-08", 5
+    )
+    # A complete frame says nothing.
+    served(lambda r: csv_response(sessions_csv(days)))
+    assert "cell missing" not in vendor.get_indicators("SAP.DE", "vwma", "2026-09-08", 5)
+
+
+def test_every_supported_indicator_derives_a_warm_up_floor():
+    # The mask is only as honest as the window behind it: an indicator whose
+    # floor cannot be derived falls back to blanking row 0 alone, and the rest
+    # of its warm-up prints numbers computed from too little history while the
+    # framework's yfinance path prints real ones. Three of these read None
+    # until the comma tuple and the trailing strip were handled, and pinning
+    # the whole table is what catches the next indicator added without a floor.
+    assert {name: vendor._warmup_rows(name) for name in sorted(vendor.SUPPORTED_INDICATORS)} == {
+        "atr": 14,
+        "boll": 20,
+        "boll_lb": 20,
+        "boll_ub": 20,
+        "close_10_ema": 10,
+        "close_200_sma": 200,
+        "close_50_sma": 50,
+        "macd": 26,
+        "macdh": 26,
+        "macds": 26,
+        "mfi": 14,
+        "rsi": 14,
+        "vwma": 14,
+    }
+
+
+def test_the_window_derivation_survives_a_stockstats_without_dft_windows(monkeypatch):
+    # `dft_windows` is undocumented in 0.6.8 and the pin permits any 0.6.x, so
+    # a resolution without it must not take the vendor module, and the CLI
+    # with it, down. The floors are then read from the fallback table.
+    monkeypatch.setattr(vendor, "_stockstats_dft_windows", None)
+    assert vendor._warmup_rows("macd") == 26
+    assert vendor._warmup_rows("macds") == 26
+    assert vendor._warmup_rows("boll_ub") == 20
+    assert vendor._warmup_rows("close_200_sma") == 200
+
+
 def test_the_first_row_of_the_frame_is_never_a_reported_value(served):
-    # MACD has no single window to warm up, so the mask cannot be sized from
-    # the name. Row 0 is still seeded by one session: stockstats reports 0.0
-    # there, which reads as a settled momentum reading that nothing supports.
+    # Row 0 is seeded by one session: stockstats reports 0.0 for MACD there,
+    # which reads as a settled momentum reading that nothing supports. Every
+    # supported indicator now derives a window, so this floor is what is left
+    # for a name the derivation cannot size, and it holds whatever the name.
+    assert vendor._warmup_span("no_such_indicator") == 1
     days = trading_days(date(2026, 9, 8), 3)
     served(lambda r: csv_response(sessions_csv(days)))
     lines = vendor.get_indicators("SAP.DE", "macd", "2026-09-08", 6).splitlines()
@@ -591,6 +749,22 @@ def test_a_superseded_client_is_closed_once_nothing_can_still_be_serving_it(serv
     assert first.is_closed and not second.is_closed
     _session._reset_client()
     assert second.is_closed
+
+
+def test_a_client_closed_under_an_in_flight_read_is_a_send_it_again(served):
+    # One generation of grace is not safety: two rotations inside one
+    # in-flight request, or a `_reset_client` beside it, still close a client
+    # under its caller, and httpx answers the next send on it with a
+    # RuntimeError that says nothing about the read. Passed through unchanged
+    # it surfaces as an unexplained crash rather than the retry it is.
+    served(
+        lambda r: envelope({"subject": {"ticker": "SAP.DE"}, "from": "x", "to": "y", "items": []})
+    )
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    _session._client_instance.close()
+    with pytest.raises(VendorRateLimitError) as raised:
+        vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert "send the read again" in str(raised.value)
 
 
 def test_a_refusal_without_details_still_names_the_reason(served):
