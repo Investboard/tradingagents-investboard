@@ -10,9 +10,12 @@ import httpx
 REASON_BY_STATUS = {
     401: "unauthorized",
     402: "access_paused",
+    403: "subject_out_of_scope",
+    404: "no_policy",
     413: "payload_too_large",
     422: "subject_unresolvable",
     429: "daily_cap_reached",
+    503: "provider_unavailable",
 }
 
 
@@ -72,3 +75,58 @@ class InvestboardClient:
             "/api/v1/agent/runs", params={"ticker": ticker, "limit": str(limit)}
         )
         return self._unwrap(response)
+
+    def _unwrap_text(self, response: httpx.Response) -> str:
+        """A raw-body read (text/csv): a refusal still arrives as the JSON envelope."""
+        if response.status_code >= 400:
+            self._unwrap(response)
+        return response.text
+
+    def get_ohlcv(self, ticker: str, start_date: str, end_date: str) -> str:
+        response = self._client.get(
+            "/api/v1/agent/data/ohlcv",
+            params={"ticker": ticker, "from": start_date, "to": end_date},
+            headers={"accept": "text/csv"},
+        )
+        return self._unwrap_text(response)
+
+    def get_fundamentals(self, ticker: str, as_of: str | None = None) -> Any:
+        params = {"ticker": ticker}
+        if as_of:
+            params["asOf"] = as_of
+        return self._unwrap(self._client.get("/api/v1/agent/data/fundamentals", params=params))
+
+    def get_statements(
+        self, ticker: str, statement: str, period: str, as_of: str | None = None
+    ) -> Any:
+        params = {"ticker": ticker, "statement": statement, "period": period}
+        if as_of:
+            params["asOf"] = as_of
+        return self._unwrap(self._client.get("/api/v1/agent/data/statements", params=params))
+
+    def get_news(self, ticker: str, start_date: str, end_date: str) -> Any:
+        return self._unwrap(
+            self._client.get(
+                "/api/v1/agent/data/news",
+                params={"ticker": ticker, "from": start_date, "to": end_date},
+            )
+        )
+
+    def get_insider(self, ticker: str, start_date: str, end_date: str) -> Any:
+        return self._unwrap(
+            self._client.get(
+                "/api/v1/agent/data/insider",
+                params={"ticker": ticker, "from": start_date, "to": end_date},
+            )
+        )
+
+    def register_subject(self, ticker: str) -> Any:
+        return self._unwrap(self._client.post("/api/v1/agent/subjects", json={"ticker": ticker}))
+
+    def get_policy(self) -> Any:
+        return self._unwrap(self._client.get("/api/v1/agent/context/policy"))
+
+    def get_position(self, ticker: str) -> Any:
+        return self._unwrap(
+            self._client.get("/api/v1/agent/context/position", params={"ticker": ticker})
+        )
