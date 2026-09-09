@@ -242,6 +242,12 @@ WARMUP_NOTE = (
     "is shorter than the indicator needs, not that the value could not be computed."
 )
 
+# The server pulls its `to` back to the last completed UTC day, so on a default
+# run the analysis date itself is served by no row however busily the market is
+# trading. Reported under the closure sentence below, that reads as a holiday
+# the market never had, so a day past the last row served says what it is.
+UNSERVED_LINE = "N/A: after the last completed session ({last})"
+
 # A null cell is not blanked. A missing volume among valid rows is skipped by
 # the rolling sums rather than propagated, so the VWMA of that session and the
 # thirteen after it is computed from fewer rows and still printed as a number.
@@ -373,6 +379,8 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
     served = _frame_from_csv(text)
     # Counted before the wrap, which adds the computed columns to the frame.
     incomplete = _incomplete_sessions(served)
+    # `get_stock_data` refuses an empty body, so the frame has a last session.
+    last_session = served.index[-1].date()
     frame = wrap(served)
     series = _with_warmup_blanked(frame, indicator)
     by_day = {index.date(): value for index, value in series.items()}
@@ -380,10 +388,13 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
     day = end
     first = end - timedelta(days=look_back_days)
     while day >= first:
-        # A day the market never traded and a day whose indicator could not be
-        # computed are different facts, and the framework says so in different
-        # words. Collapsing them would read as a market closure that never was.
-        if day not in by_day:
+        # A day the market never traded, a day the server has not served yet
+        # and a day whose indicator could not be computed are three different
+        # facts, and each is said in its own words. Collapsing any two of them
+        # would read as a market closure that never was.
+        if day > last_session:
+            lines.append(f"{day.isoformat()}: {UNSERVED_LINE.format(last=last_session)}")
+        elif day not in by_day:
             lines.append(f"{day.isoformat()}: N/A: Not a trading day (weekend or holiday)")
         elif pd.isna(by_day[day]):
             lines.append(f"{day.isoformat()}: N/A")

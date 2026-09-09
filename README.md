@@ -140,6 +140,20 @@ neither data nor a position for it. The position block is read before the first 
 costs you no model time. Either add the instrument to a watchlist in Investboard, or run `analyze`
 again with `--register`.
 
+**`Error: No available vendor for 'get_stock_data'`**
+
+The method named varies (`get_indicators`, `get_fundamentals`), the cause does not: Investboard
+refused a data read with a daily cap (429) or a provider outage (503), and it is the only vendor
+configured for prices, indicators and fundamentals. The framework reads both refusals as "try the
+next vendor", so where there is no next vendor it ends the chain on that sentence, which names
+neither. The `WARNING` line logged just above it does. `daily_read_cap_reached` is your own reads
+for this UTC day, spent, and it carries `retry_after_seconds`, the wait in whole seconds.
+`provider_unavailable` is the market-data provider behind Investboard, and waiting is the remedy
+there too. Run the analysis again after the wait, or run it now with `--vendor default`, which
+takes prices, indicators and fundamentals from the framework's own vendors and asks Investboard
+only for the policy and position blocks. The position block is read under the same cap, so a cap
+fully spent is a wait either way.
+
 **A run finished but the post did not**
 
 The payload is in `~/.tradingagents/investboard/outbox/`, one JSON file per run, and nothing has

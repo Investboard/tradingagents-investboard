@@ -126,6 +126,73 @@ def test_a_holding_the_server_could_not_value_says_so():
     assert "(0.0% of the household" not in block
 
 
+def test_a_household_weight_the_server_could_not_measure_is_said_not_printed():
+    """`household_weight_pct` is nullable, and `None%` is not a weight.
+
+    The server answers an absent denominator with null rather than with a zero:
+    where nothing carried a countable value, zero per cent would read as a
+    negligible position rather than as a book that could not be valued.
+    Interpolated into the header, that null prints `None%`.
+    """
+    held = context.render_position_block({**POSITION, "household_weight_pct": None})
+    not_held = context.render_position_block(
+        {**POSITION, "held": False, "portfolios": [], "household_weight_pct": None}
+    )
+
+    for block in (held, not_held):
+        assert "None" not in block
+        assert (
+            "The household weight could not be measured: no holding in the household "
+            "carried a countable value." in block
+        )
+    # The rows the server did serve are still rendered under a header of their own.
+    assert "The owner holds SAP.DE (as of 2026-09-09T08:00:00.000Z):" in held
+    assert "Depot A: 100 units" in held
+
+
+def test_a_weight_is_quoted_with_the_book_it_was_measured_over():
+    """The server sends the counts so a weight is never read without its denominator.
+
+    The household counts and a row's own counts arrive under one field name at
+    two scopes, and each belongs beside the weight measured over it.
+    """
+    row = {**POSITION["portfolios"][0], "coverage": {"priced_count": 1, "total_count": 2}}
+    block = context.render_position_block(
+        {**POSITION, "portfolios": [row], "coverage": {"priced_count": 3, "total_count": 4}}
+    )
+
+    assert "20.0% of the household (3 of 4 holdings priced), as of" in block
+    assert "33.33% of that portfolio (1 of 2 holdings priced), market value" in block
+
+
+def test_a_single_holding_is_counted_in_the_singular():
+    row = {**POSITION["portfolios"][0], "coverage": {"priced_count": 1, "total_count": 1}}
+    block = context.render_position_block({**POSITION, "portfolios": [row]})
+
+    assert "(1 of 1 holding priced)" in block
+
+
+def test_an_unmeasured_weight_carries_the_counts_that_explain_it():
+    block = context.render_position_block(
+        {
+            **POSITION,
+            "household_weight_pct": None,
+            "coverage": {"priced_count": 0, "total_count": 4},
+        }
+    )
+
+    assert "carried a countable value (0 of 4 holdings priced)." in block
+
+
+def test_counts_the_server_did_not_send_are_not_invented():
+    """Coverage is optional on the wire, and an absent pair renders as before."""
+    block = context.render_position_block(POSITION)
+
+    assert "priced)" not in block
+    assert "20.0% of the household, as of" in block
+    assert "33.33% of that portfolio, market value" in block
+
+
 def test_the_freshness_claim_is_the_servers_date_never_the_word_today():
     """The block quotes the server's `as_of`; it never dates anything itself."""
     held = context.render_position_block(POSITION)

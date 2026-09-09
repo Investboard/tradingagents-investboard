@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 
 import httpx
@@ -422,6 +423,76 @@ def test_refusals_map_to_the_framework_errors(served, status, reason, expected):
     assert str(raised.value).count(reason) == 1
     if reason == "subject_out_of_scope":
         assert "register it" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(429, "daily_read_cap_reached"), (503, "provider_unavailable")],
+    ids=["a daily cap", "a provider outage"],
+)
+def test_a_rate_limit_is_logged_because_the_router_drops_its_message(
+    served, caplog, status, reason
+):
+    """The translated sentence survives a chain the framework exhausts silently.
+
+    `route_to_vendor` records a `VendorNotConfiguredError` as its `first_error`
+    and raises it when no vendor could serve the call, but it does not record a
+    `VendorRateLimitError`: that one only moves it to the next vendor. Where
+    Investboard is the only vendor for the category, which is what the CLI
+    configures for prices, indicators and fundamentals, the chain is then
+    exhausted with nothing kept and the framework raises a bare
+    `RuntimeError("No available vendor for ...")`. The daily cap, the outage,
+    the reason and any wait the server named are all lost with it, so the
+    translated message is logged before the raise.
+    """
+    served(lambda r: refusal(status, reason))
+
+    with caplog.at_level(logging.WARNING, logger="tradingagents_investboard._session"):
+        with pytest.raises(VendorRateLimitError):
+            vendor.get_stock_data("SAP.DE", "2026-09-01", "2026-09-08")
+
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert [line for line in warnings if reason in line and "Investboard" in line]
+
+
+def test_a_configuration_fault_is_not_logged_because_the_router_keeps_it(served, caplog):
+    """The negative control: only what the router drops is written to the log.
+
+    A `VendorNotConfiguredError` becomes the router's `first_error` and is
+    raised once the chain is exhausted, so the CLI prints the server's own
+    sentence. Logging that one too would put every refusal in the log twice and
+    make the rate-limit line worth less for being ordinary.
+    """
+    served(lambda r: refusal(402, "access_paused"))
+
+    with caplog.at_level(logging.WARNING, logger="tradingagents_investboard._session"):
+        with pytest.raises(VendorNotConfiguredError):
+            vendor.get_stock_data("SAP.DE", "2026-09-01", "2026-09-08")
+
+    assert not [
+        record for record in caplog.records if record.name == "tradingagents_investboard._session"
+    ]
+
+
+def test_the_day_the_server_has_not_served_yet_is_not_called_a_market_closure(served):
+    """The analysis date itself has no row on a default run, and it is no holiday.
+
+    The server pulls its `to` back to the last completed UTC day, so today is
+    served by no row however busily the market is trading. Reported under the
+    closure sentence, that reads as a holiday the market never had.
+    """
+    days = trading_days(date(2026, 9, 8), 30)
+    served(lambda r: csv_response(sessions_csv(days)))
+
+    lines = vendor.get_indicators("SAP.DE", "close_10_ema", "2026-09-09", 6).splitlines()
+
+    assert "2026-09-09: N/A: after the last completed session (2026-09-08)" in lines
+    assert "2026-09-09: N/A: Not a trading day (weekend or holiday)" not in lines
+    # A day inside the served window with no row is still the market being shut.
+    assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
+    assert not [line for line in lines if line.startswith("2026-09-08: ") and "N/A" in line]
 
 
 def test_a_traded_day_without_a_computed_value_reads_na_not_a_holiday(served):

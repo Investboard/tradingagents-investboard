@@ -8,6 +8,7 @@ to reason about the connection and one place for a test to route.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -21,6 +22,8 @@ from tradingagents.dataflows.errors import (
 
 from .auth import NOT_CONNECTED, UNREACHABLE, access_token, base_url
 from .client import InvestboardApiError, InvestboardClient
+
+logger = logging.getLogger(__name__)
 
 # Test seam: a MockTransport routed through here never reads the token file.
 _transport: httpx.BaseTransport | None = None
@@ -159,10 +162,25 @@ def _translate(error: Exception, symbol: str) -> Exception:
 
 
 def _call(symbol: str, fn: Callable[[InvestboardClient], Any]) -> Any:
+    """One read, with a refusal translated on its way out and a rate limit logged.
+
+    The log line is what a rate limit leaves behind. ``route_to_vendor`` keeps a
+    ``VendorNotConfiguredError`` as its ``first_error`` and raises it when the
+    chain is exhausted, so that message reaches the user; it keeps nothing for a
+    ``VendorRateLimitError``, which only moves it to the next vendor. The CLI
+    names Investboard as the only vendor for prices, indicators and
+    fundamentals, so there is no next vendor there and the framework ends the
+    chain with a bare ``RuntimeError("No available vendor for ...")``. The daily
+    cap, the provider outage, the reason and any wait the server named all
+    disappear into that sentence, so the translated message is written to the
+    run's log before the raise, where the reader can still act on it.
+    """
     try:
         return fn(_client())
     except (InvestboardApiError, RuntimeError, httpx.TransportError) as error:
         translated = _translate(error, symbol)
         if translated is error:
             raise
+        if isinstance(translated, VendorRateLimitError):
+            logger.warning("%s", translated)
         raise translated from error

@@ -15,10 +15,16 @@ amount. Every number is the server's, in the currency the server named it in,
 and every date is the server's too.
 
 A money amount the server omitted is said in words rather than filled with a
-zero. Of the fields this module renders, the position contract makes only the
-cost basis, the first-acquired date, the asset class and its band nullable, so
-nothing else needs that treatment: quantity, the two weights and the market
-value are required, and are rendered as they arrive.
+zero, and so is a weight it could not measure. Of the fields this module
+renders, the position contract makes the cost basis, the first-acquired date,
+the asset class, its band and the household weight nullable. That last one is
+null where no holding in the household carried a countable value: with no
+denominator, zero per cent would read as a negligible position rather than as
+a book that could not be valued, so it is said in words too. A row's quantity,
+its weight of its own portfolio and its market value are required, and are
+rendered as they arrive. Where the server sends its coverage counts, the
+weight they belong to is quoted with them, because a percentage nobody can see
+the denominator of cannot be read.
 """
 
 from __future__ import annotations
@@ -33,6 +39,10 @@ NO_POLICY_NOTE = (
     "No investment policy is on file for the owner; no mandate check will run on this run."
 )
 NOT_ON_FILE = "not on file"
+UNMEASURED_HOUSEHOLD_WEIGHT = (
+    "The household weight could not be measured: no holding in the household carried a "
+    "countable value"
+)
 
 
 def _money(cents: int | None, currency: str | None) -> str:
@@ -49,6 +59,26 @@ def _money(cents: int | None, currency: str | None) -> str:
     if cents is None or currency is None:
         return NOT_ON_FILE
     return f"{cents / 100:.2f} {currency}"
+
+
+def _coverage(counts: dict[str, Any] | None) -> str:
+    """The book a weight was measured over, as the server's own two counts.
+
+    The server publishes these precisely so a weight is never read without its
+    denominator: "100% of that portfolio" is one lone holding or one priced
+    holding beside an unvalued one, and the percentage alone cannot tell the
+    two apart.
+
+    The block carries the household's counts and each row its own portfolio's,
+    under one field name at two scopes, so each call site passes the counts of
+    the book its own weight names. Both are optional on the wire, and an absent
+    pair renders nothing rather than a denominator this module made up.
+    """
+    if not counts:
+        return ""
+    total = counts["total_count"]
+    holdings = "holding" if total == 1 else "holdings"
+    return f" ({counts['priced_count']} of {total} {holdings} priced)"
 
 
 def render_policy_block(document: dict[str, Any]) -> str:
@@ -73,24 +103,32 @@ def render_position_block(block: dict[str, Any]) -> str:
     "today", which was the one claim this module used to make for itself.
     """
     ticker = block["subject"]["ticker"]
+    weight = block.get("household_weight_pct")
+    household = _coverage(block.get("coverage"))
     lines: list[str] = []
     if not block.get("held"):
         lines.append(f"The owner does not hold {ticker}. Any proposal is a new position.")
     elif not block.get("portfolios"):
         # The server reports a holding whose value it could not measure as held
         # with no row, rather than as not held or as worth nothing, and the
-        # household weight counts priced holdings only, so it arrives as 0.
-        # Rendering the ordinary header here would state that 0 as the owner's
-        # weight and then leave the colon with nothing under it.
+        # household weight counts priced holdings only, so it arrives as 0, or
+        # as null where nothing in the household was priced at all. Rendering
+        # the ordinary header here would state that 0 as the owner's weight and
+        # then leave the colon with nothing under it.
         lines.append(
             f"The owner holds {ticker}, but no valued position for it could be measured, "
             f"so this block states no quantity, weight or amount for it."
         )
     else:
-        lines.append(
-            f"The owner holds {ticker} ({block['household_weight_pct']}% of the household, "
-            f"as of {block['as_of']}):"
+        # A null weight is the server declining to answer an absent denominator
+        # with a zero, and interpolated it prints `None%`. The header then says
+        # only what it can, and the sentence below says what it could not.
+        measured = (
+            f"as of {block['as_of']}"
+            if weight is None
+            else f"{weight}% of the household{household}, as of {block['as_of']}"
         )
+        lines.append(f"The owner holds {ticker} ({measured}):")
         for row in block["portfolios"]:
             acquired = (
                 f", first acquired {row['first_acquired_at'][:10]}"
@@ -101,9 +139,12 @@ def render_position_block(block: dict[str, Any]) -> str:
             cost_basis = _money(row.get("cost_basis_native_cents"), row.get("cost_basis_currency"))
             lines.append(
                 f"- {row['portfolio_name']}: {row['quantity']} units, "
-                f"{row['weight_pct_of_portfolio']}% of that portfolio, "
+                f"{row['weight_pct_of_portfolio']}% of that portfolio"
+                f"{_coverage(row.get('coverage'))}, "
                 f"market value {market_value}, cost basis {cost_basis}{acquired}."
             )
+    if weight is None:
+        lines.append(f"{UNMEASURED_HOUSEHOLD_WEIGHT}{household}.")
     band = block.get("band")
     if band and block.get("asset_class"):
         lines.append(
