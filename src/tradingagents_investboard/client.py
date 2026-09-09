@@ -11,7 +11,6 @@ REASON_BY_STATUS = {
     401: "unauthorized",
     402: "access_paused",
     403: "subject_out_of_scope",
-    404: "no_policy",
     413: "payload_too_large",
     422: "subject_unresolvable",
     429: "daily_cap_reached",
@@ -79,7 +78,15 @@ class InvestboardClient:
     def _unwrap_text(self, response: httpx.Response) -> str:
         """A raw-body read (text/csv): a refusal still arrives as the JSON envelope."""
         if response.status_code >= 400:
+            # `_unwrap` raises for every one of these. The raise below is what
+            # the reader can see, so the refusal path does not rest on a side
+            # effect of a call whose name says it returns a value.
             self._unwrap(response)
+            raise InvestboardApiError(
+                response.status_code,
+                REASON_BY_STATUS.get(response.status_code, "error"),
+                response.text[:200],
+            )
         return response.text
 
     def get_ohlcv(self, ticker: str, start_date: str, end_date: str) -> str:
@@ -88,7 +95,14 @@ class InvestboardClient:
             params={"ticker": ticker, "from": start_date, "to": end_date},
             headers={"accept": "text/csv"},
         )
-        return self._unwrap_text(response)
+        text = self._unwrap_text(response)
+        # A 2xx is not by itself CSV: a protected deployment answers a login
+        # page with 200, and that must never reach the agents as prices.
+        if not text.startswith("# Stock data"):
+            raise InvestboardApiError(
+                response.status_code, "unexpected_body", "the OHLCV read did not answer CSV text"
+            )
+        return text
 
     def get_fundamentals(self, ticker: str, as_of: str | None = None) -> Any:
         params = {"ticker": ticker}

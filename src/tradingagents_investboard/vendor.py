@@ -13,47 +13,26 @@ Only what the app already serves comes from here: sentiment, macro and
 prediction markets stay on the framework's own vendors, and ``get_global_news``
 is not registered, so a ``news_data`` chain of ``investboard,yfinance`` serves
 company news from Investboard and global news from yfinance.
+
+The HTTP client, the token it carries and the translation of a refusal into the
+framework's errors live in ``_session``; what follows is rendering.
 """
 
 from __future__ import annotations
 
 import csv
 import io
-from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-import httpx
 import pandas as pd
 from stockstats import wrap
-from tradingagents.dataflows.errors import (
-    NoMarketDataError,
-    VendorNotConfiguredError,
-    VendorRateLimitError,
-)
+from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.interface import VENDOR_LIST, VENDOR_METHODS
 
-from .auth import access_token, base_url
-from .client import InvestboardApiError, InvestboardClient
+from ._session import _call
 
 VENDOR_NAME = "investboard"
-
-# Test seam: a MockTransport routed through here never reads the token file.
-_transport: httpx.BaseTransport | None = None
-_client_instance: InvestboardClient | None = None
-
-
-def _reset_client() -> None:
-    global _client_instance
-    _client_instance = None
-
-
-def _client() -> InvestboardClient:
-    """One client per process; the token is read when the client is built."""
-    global _client_instance
-    if _client_instance is None:
-        _client_instance = InvestboardClient(base_url(), access_token(), transport=_transport)
-    return _client_instance
 
 
 def _today() -> str:
@@ -64,44 +43,50 @@ def _retrieved_on() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _translate(error: InvestboardApiError, symbol: str) -> Exception:
-    """The framework's own error taxonomy, so its vendor chain can act on ours.
-
-    A cap or a provider outage is a rate limit to the router (next vendor, or
-    wait). A credential fault, a paused account or an instrument outside the
-    data scope is a configuration the user has to fix, and the message carries
-    the server's hint so the CLI prints the next step. An instrument the
-    provider does not carry is no market data.
-    """
-    if error.status in (429, 503):
-        return VendorRateLimitError(f"Investboard: {error.message}")
-    if error.status in (401, 402, 403):
-        return VendorNotConfiguredError(f"Investboard: {error.reason}: {error.message}")
-    if error.status == 422:
-        return NoMarketDataError(symbol, None, error.message)
-    return error
-
-
-def _call(symbol: str, fn: Callable[[InvestboardClient], Any]) -> Any:
-    try:
-        return fn(_client())
-    except InvestboardApiError as error:
-        raise _translate(error, symbol) from error
-
-
 # --- OHLCV ---------------------------------------------------------------
+
+
+def _split_csv(text: str) -> tuple[str, str]:
+    """The header block and the rows, which the blank line separates."""
+    header, separator, body = text.partition("\n\n")
+    return (header, body) if separator else ("", text)
+
+
+def _parse_csv_header(text: str) -> dict[str, str]:
+    """The ``# key: value`` lines the server writes above the rows.
+
+    Read as fields rather than searched for as substrings: ``Total records`` and
+    ``Truncated`` both say something the reader has to act on, and a substring
+    test cannot tell a header line from a value that happens to contain it.
+    """
+    fields: dict[str, str] = {}
+    for line in _split_csv(text)[0].splitlines():
+        if not line.startswith("#"):
+            continue
+        key, separator, value = line.lstrip("#").partition(":")
+        if separator:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def _data_rows(text: str) -> list[str]:
+    """The session rows under the column line; empty when the window has none."""
+    lines = [line for line in _split_csv(text)[1].splitlines() if line.strip()]
+    return lines[1:]
 
 
 def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     """Daily OHLCV as the framework's CSV text; the server renders the shape."""
     text = _call(symbol, lambda c: c.get_ohlcv(symbol, start_date, end_date))
-    if "# Total records: 0" in text:
+    # Emptiness is what the rows say, not what the header claims: a count that
+    # disagrees with the body would otherwise decide it.
+    if not _data_rows(text):
         raise NoMarketDataError(symbol, symbol, f"no rows between {start_date} and {end_date}")
     return text
 
 
 def _frame_from_csv(text: str) -> pd.DataFrame:
-    body = text.split("\n\n", 1)[1] if "\n\n" in text else text
+    body = _split_csv(text)[1]
     frame = pd.read_csv(io.StringIO(body))
     frame["Date"] = pd.to_datetime(frame["Date"])
     frame = frame.set_index("Date").sort_index()
@@ -164,9 +149,19 @@ SUPPORTED_INDICATORS = {
     ),
 }
 
-# Sessions the longest supported window (the 200 SMA) needs before the first
-# reported day, plus a margin for holidays.
-_HISTORY_SESSIONS = 320
+# One read is capped at 400 sessions, about 583 calendar days. The window below
+# is the reported days plus the warm-up the longest supported average (the 200
+# SMA, about 300 calendar days of sessions) needs before the first of them:
+# 275 + 300 = 575 calendar days, inside the cap. Above that the warm-up would be
+# the part the server drops, so the read is refused rather than quietly served
+# with averages computed from a truncated history.
+WARMUP_CALENDAR_DAYS = 300
+MAX_LOOK_BACK_DAYS = 275
+
+TRUNCATION_NOTE = (
+    "Note: the price history was truncated to the newest sessions; values at the start of "
+    "the window may be incomplete."
+)
 
 
 def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: int = 30) -> str:
@@ -175,8 +170,12 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
             f"Indicator {indicator} is not supported. "
             f"Choose from: {', '.join(SUPPORTED_INDICATORS)}"
         )
+    if look_back_days > MAX_LOOK_BACK_DAYS:
+        raise ValueError(
+            f"look_back_days above {MAX_LOOK_BACK_DAYS} exceeds the history one read can serve"
+        )
     end = date.fromisoformat(curr_date)
-    start = end - timedelta(days=int(_HISTORY_SESSIONS * 1.5))
+    start = end - timedelta(days=look_back_days + WARMUP_CALENDAR_DAYS)
     text = get_stock_data(symbol, start.isoformat(), end.isoformat())
     frame = wrap(_frame_from_csv(text))
     series = frame[indicator]
@@ -185,14 +184,21 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
     day = end
     first = end - timedelta(days=look_back_days)
     while day >= first:
-        value = by_day.get(day)
-        if value is None or pd.isna(value):
+        # A day the market never traded and a day whose indicator could not be
+        # computed are different facts, and the framework says so in different
+        # words. Collapsing them would read as a market closure that never was.
+        if day not in by_day:
             lines.append(f"{day.isoformat()}: N/A: Not a trading day (weekend or holiday)")
+        elif pd.isna(by_day[day]):
+            lines.append(f"{day.isoformat()}: N/A")
         else:
-            lines.append(f"{day.isoformat()}: {float(value):.4f}")
+            lines.append(f"{day.isoformat()}: {float(by_day[day]):.6g}")
         day -= timedelta(days=1)
     header = f"## {indicator} values from {first.isoformat()} to {curr_date}:"
-    return f"{header}\n\n" + "\n".join(lines) + f"\n\n{SUPPORTED_INDICATORS[indicator]}"
+    description = SUPPORTED_INDICATORS[indicator]
+    if _parse_csv_header(text).get("Truncated", "").lower() == "true":
+        description = f"{TRUNCATION_NOTE}\n{description}"
+    return f"{header}\n\n" + "\n".join(lines) + f"\n\n{description}"
 
 
 # --- Fundamentals and statements ------------------------------------------
@@ -225,16 +231,24 @@ _CURRENT_VALUE_BLOCKS = ("profile", "ratios_ttm")
 def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
     data = _call(ticker, lambda c: c.get_fundamentals(ticker, curr_date))
     point_in_time = data.get("point_in_time") or {}
+    # The newest period the server carried, not whatever the list happened to
+    # put first: the order is the server's, and reading position 0 as "latest"
+    # would date the ratios to an older filing without saying so.
+    periods = data.get("key_metrics") or []
+    latest = max(periods, key=lambda row: row.get("date") or "") if periods else {}
     blocks = {
         "profile": data.get("profile") or {},
         "ratios_ttm": data.get("ratios_ttm") or {},
-        "key_metrics": (data.get("key_metrics") or [{}])[0],
+        "key_metrics": latest,
     }
     lines = [
         f"# Company Fundamentals for {ticker}",
         f"# Data retrieved on: {_retrieved_on()}",
         "",
     ]
+    if latest.get("date"):
+        lines.append(f"Key metrics as of: {latest['date']}")
+    rendered = 0
     for label, block, field in _FUNDAMENTAL_LABELS:
         value = blocks[block].get(field)
         if value is None:
@@ -245,7 +259,8 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
         if curr_date and block in _CURRENT_VALUE_BLOCKS and not point_in_time.get(block, False):
             note = f" (current values, not as of {curr_date})"
         lines.append(f"{label}: {value}{note}")
-    if len(lines) == 3:
+        rendered += 1
+    if not rendered:
         raise NoMarketDataError(ticker, ticker, "no fundamental fields returned")
     return "\n".join(lines)
 
@@ -296,7 +311,7 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
         return f"No news found for {ticker} between {start_date} and {end_date}"
     out = [f"## {ticker} News, from {start_date} to {end_date}:", ""]
     for item in items:
-        out.append(f"### {item['title']} (source: {item.get('publisher') or 'unknown'})")
+        out.append(f"### {item['title']} (source: {item.get('publisher') or 'Unknown'})")
         if item.get("summary"):
             out.append(item["summary"])
         if item.get("url"):

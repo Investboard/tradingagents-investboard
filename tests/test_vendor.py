@@ -11,7 +11,9 @@ from tradingagents.dataflows.errors import (
 )
 from tradingagents.dataflows.interface import VENDOR_LIST, VENDOR_METHODS
 
-from tradingagents_investboard import vendor
+from tradingagents_investboard import _session, vendor
+from tradingagents_investboard.auth import NOT_CONNECTED
+from tradingagents_investboard.client import InvestboardApiError
 
 OHLCV_CSV = (
     "# Stock data for SAP.DE from 2026-09-01 to 2026-09-03\n"
@@ -43,6 +45,34 @@ def refusal(status: int, reason: str, hint: str | None = None) -> httpx.Response
     )
 
 
+def trading_days(last: date, count: int) -> list[date]:
+    """``count`` weekdays ending on ``last``, oldest first."""
+    days: list[date] = []
+    day = last
+    while len(days) < count:
+        if day.weekday() < 5:
+            days.append(day)
+        day -= timedelta(days=1)
+    return sorted(days)
+
+
+def sessions_csv(days: list[date], volume: str = "1000", truncated: str | None = None) -> str:
+    """The server's OHLCV CSV over ``days``, one row a session."""
+    rows = "\n".join(
+        f"{day.isoformat()},{100 + i},{101 + i},{99 + i},{100.5 + i},{volume}"
+        for i, day in enumerate(days)
+    )
+    header = ["# Stock data", f"# Total records: {len(days)}"]
+    if truncated is not None:
+        header.append(f"# Truncated: {truncated}")
+    header.append("# Data retrieved on: x")
+    return "\n".join(header) + "\n\nDate,Open,High,Low,Close,Volume\n" + rows + "\n"
+
+
+def csv_response(text: str) -> httpx.Response:
+    return httpx.Response(200, text=text, headers={"content-type": "text/csv"})
+
+
 @pytest.fixture
 def served(monkeypatch):
     """Route every vendor call to a handler; the vendor never reads the token file here."""
@@ -53,13 +83,16 @@ def served(monkeypatch):
             calls.append(request)
             return handler(request)
 
-        monkeypatch.setattr(vendor, "_transport", httpx.MockTransport(routed))
-        monkeypatch.setattr(vendor, "access_token", lambda *a, **k: "tok")
-        monkeypatch.setattr(vendor, "base_url", lambda: "https://app.example")
-        vendor._reset_client()
+        monkeypatch.setattr(_session, "_transport", httpx.MockTransport(routed))
+        monkeypatch.setattr(_session, "access_token", lambda *a, **k: "tok")
+        monkeypatch.setattr(_session, "base_url", lambda: "https://app.example")
+        _session._reset_client()
         return calls
 
-    return install
+    yield install
+    # The client is a module singleton: left in place it would carry this
+    # test's transport into the next one.
+    _session._reset_client()
 
 
 def test_importing_the_module_registers_the_eight_methods_and_nothing_else():
@@ -134,6 +167,9 @@ def test_fundamentals_render_the_label_lines(served):
                     "beta": 1.1,
                 },
                 "key_metrics": [
+                    # Older first, so a reader that takes position 0 as the
+                    # latest period dates every metric to the wrong filing.
+                    {"date": "2024-12-31", "pbRatio": 9.9, "roe": 0.03, "eps": 1.1},
                     {
                         "date": "2025-12-31",
                         "pbRatio": 5.1,
@@ -156,6 +192,7 @@ def test_fundamentals_render_the_label_lines(served):
     assert "Name: SAP SE" in text and "Sector: Technology" in text
     assert "PE Ratio (TTM): 30.5" in text and "Dividend Yield: 0.011" in text
     assert "Price to Book: 5.1" in text and "Return on Equity: 0.12" in text
+    assert "Key metrics as of: 2025-12-31" in text
     assert "(current values, not as of 2026-09-08)" in text
 
 
@@ -271,3 +308,109 @@ def test_refusals_map_to_the_framework_errors(served, status, reason, expected):
         vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
     if reason == "subject_out_of_scope":
         assert "register it" in str(raised.value)
+
+
+def test_a_traded_day_without_a_computed_value_reads_na_not_a_holiday(served):
+    # Three sessions, so the first has no standard deviation behind it and
+    # `boll_ub` cannot be computed on it. That day traded, so the framework's
+    # holiday sentence would be a lie about the market; "N/A" is the truth.
+    days = trading_days(date(2026, 9, 8), 3)
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", "boll_ub", "2026-09-08", 6).splitlines()
+    assert "2026-09-04: N/A" in lines
+    assert "2026-09-04: N/A: Not a trading day (weekend or holiday)" not in lines
+    assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
+
+
+def test_a_frame_too_short_for_the_200_sma_reports_every_session_it_has(served):
+    # Sixty sessions, far short of the 200-session warm-up. stockstats fills a
+    # moving average from the first row it holds, so these render as values
+    # rather than gaps; what must not happen either way is a day that traded
+    # being reported as a market closure.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", "close_200_sma", "2026-09-08", 5).splitlines()
+    traded = [line for line in lines if line[:10] in {"2026-09-04", "2026-09-07", "2026-09-08"}]
+    assert len(traded) == 3
+    assert all("Not a trading day" not in line for line in traded)
+    assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
+
+
+def test_volume_the_server_left_null_reads_na_on_the_days_that_traded(served):
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days, volume="")))
+    lines = vendor.get_indicators("SAP.DE", "vwma", "2026-09-08", 5).splitlines()
+    assert "2026-09-08: N/A" in lines and "2026-09-07: N/A" in lines
+    assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
+
+
+@pytest.mark.parametrize("indicator", sorted(vendor.SUPPORTED_INDICATORS))
+def test_every_supported_indicator_renders_over_one_frame(served, indicator):
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days)))
+    text = vendor.get_indicators("SAP.DE", indicator, "2026-09-08", 3)
+    assert text.startswith(f"## {indicator} values from 2026-09-05 to 2026-09-08:\n\n")
+    assert text.rstrip().endswith(vendor.SUPPORTED_INDICATORS[indicator])
+
+
+def test_a_truncated_history_is_declared_above_the_description(served):
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days, truncated="true")))
+    text = vendor.get_indicators("SAP.DE", "close_50_sma", "2026-09-08", 3)
+    assert vendor.TRUNCATION_NOTE in text
+    assert text.rstrip().endswith(vendor.SUPPORTED_INDICATORS["close_50_sma"])
+    served(lambda r: csv_response(sessions_csv(days, truncated="false")))
+    assert vendor.TRUNCATION_NOTE not in vendor.get_indicators(
+        "SAP.DE", "close_50_sma", "2026-09-08", 3
+    )
+
+
+def test_the_window_covers_the_warm_up_and_a_longer_look_back_is_refused(served):
+    days = trading_days(date(2026, 9, 8), 60)
+    calls = served(lambda r: csv_response(sessions_csv(days)))
+    vendor.get_indicators("SAP.DE", "close_200_sma", "2026-09-08", 30)
+    requested = date.fromisoformat(calls[0].url.params["from"])
+    assert (date(2026, 9, 8) - requested).days == 30 + vendor.WARMUP_CALENDAR_DAYS
+    with pytest.raises(ValueError) as raised:
+        vendor.get_indicators(
+            "SAP.DE", "close_50_sma", "2026-09-08", vendor.MAX_LOOK_BACK_DAYS + 1
+        )
+    assert "exceeds the history one read can serve" in str(raised.value)
+
+
+def test_a_body_that_is_not_the_csv_never_reaches_the_agents(served):
+    # What a deployment behind an access wall answers a data read with.
+    served(lambda r: httpx.Response(200, text="<!doctype html><title>Sign in</title>"))
+    with pytest.raises(InvestboardApiError) as raised:
+        vendor.get_stock_data("SAP.DE", "2026-09-01", "2026-09-03")
+    assert raised.value.reason == "unexpected_body"
+
+
+def test_the_client_is_rebuilt_when_the_token_has_been_refreshed(served, monkeypatch):
+    calls = served(
+        lambda r: envelope({"subject": {"ticker": "SAP.DE"}, "from": "x", "to": "y", "items": []})
+    )
+    issued = iter(["first", "second"])
+    monkeypatch.setattr(_session, "access_token", lambda *a, **k: next(issued, "second"))
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert [call.headers["authorization"] for call in calls] == ["Bearer first", "Bearer second"]
+
+
+def test_an_unreachable_server_and_a_missing_connection_map_to_the_framework_errors(
+    served, monkeypatch
+):
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route", request=request)
+
+    served(unreachable)
+    with pytest.raises(VendorRateLimitError):
+        vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+
+    def not_connected(*args, **kwargs):
+        raise RuntimeError(NOT_CONNECTED)
+
+    monkeypatch.setattr(_session, "access_token", not_connected)
+    with pytest.raises(VendorNotConfiguredError) as raised:
+        vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert "tradingagents-investboard connect" in str(raised.value)
