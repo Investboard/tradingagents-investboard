@@ -31,7 +31,13 @@ def envelope(data: object) -> httpx.Response:
     return httpx.Response(200, json={"data": data, "error": None, "meta": {}})
 
 
-def refusal(status: int, reason: str, hint: str | None = None) -> httpx.Response:
+def refusal(
+    status: int,
+    reason: str,
+    hint: str | None = None,
+    message: str = "the server refused the read",
+) -> httpx.Response:
+    """A refusal whose ``message`` is not its ``reason``, so a test can tell them apart."""
     details = {"reason": reason}
     if hint:
         details["hint"] = hint
@@ -39,7 +45,7 @@ def refusal(status: int, reason: str, hint: str | None = None) -> httpx.Response
         status,
         json={
             "data": None,
-            "error": {"code": "X", "message": reason, "details": details},
+            "error": {"code": "X", "message": message, "details": details},
             "meta": {},
         },
     )
@@ -56,10 +62,21 @@ def trading_days(last: date, count: int) -> list[date]:
     return sorted(days)
 
 
-def sessions_csv(days: list[date], volume: str = "1000", truncated: str | None = None) -> str:
-    """The server's OHLCV CSV over ``days``, one row a session."""
+def sessions_csv(
+    days: list[date],
+    volume: str = "1000",
+    truncated: str | None = None,
+    base: float = 100.0,
+    volumes: dict[int, str] | None = None,
+) -> str:
+    """The server's OHLCV CSV over ``days``, one row a session.
+
+    ``volumes`` overrides the volume of individual rows by index, which is how
+    a single gap among valid rows is expressed.
+    """
     rows = "\n".join(
-        f"{day.isoformat()},{100 + i},{101 + i},{99 + i},{100.5 + i},{volume}"
+        f"{day.isoformat()},{base + i},{base + 1 + i},{base - 1 + i},{base + 0.5 + i},"
+        f"{(volumes or {}).get(i, volume)}"
         for i, day in enumerate(days)
     )
     header = ["# Stock data", f"# Total records: {len(days)}"]
@@ -196,6 +213,64 @@ def test_fundamentals_render_the_label_lines(served):
     assert "(current values, not as of 2026-09-08)" in text
 
 
+def fundamentals(key_metrics: list[dict], point_in_time: dict) -> object:
+    return {
+        "subject": {"ticker": "SAP.DE"},
+        "as_of": "2026-09-08",
+        "point_in_time": point_in_time,
+        "profile": {"companyName": "SAP SE"},
+        "key_metrics": key_metrics,
+        "ratios_ttm": {"priceToEarningsRatioTTM": 30.5},
+    }
+
+
+def test_key_metrics_dated_after_the_analysis_date_are_not_the_latest(served):
+    # A filing the analysis date could not have seen is look-ahead bias, and
+    # `max` over the list picks it deterministically every run.
+    served(
+        lambda r: envelope(
+            fundamentals(
+                [
+                    {"date": "2025-12-31", "eps": 4.5},
+                    {"date": "2026-12-31", "eps": 9.9},
+                ],
+                {"profile": True, "key_metrics": True, "ratios_ttm": True},
+            )
+        )
+    )
+    text = vendor.get_fundamentals("SAP.DE", "2026-09-08")
+    assert "Key metrics as of: 2025-12-31" in text
+    assert "EPS: 4.5" in text
+    assert "2026-12-31" not in text
+
+
+def test_key_metrics_the_server_did_not_bound_carry_the_current_values_note(served):
+    served(
+        lambda r: envelope(
+            fundamentals(
+                [{"date": "2025-12-31", "eps": 4.5}],
+                {"profile": True, "key_metrics": False, "ratios_ttm": True},
+            )
+        )
+    )
+    text = vendor.get_fundamentals("SAP.DE", "2026-09-08")
+    assert "EPS: 4.5 (current values, not as of 2026-09-08)" in text
+    # The blocks the server did bound say nothing.
+    assert "Name: SAP SE\n" in text + "\n"
+    assert "PE Ratio (TTM): 30.5\n" in text + "\n"
+
+
+def test_an_undated_analysis_bounds_nothing_and_notes_nothing(served):
+    served(
+        lambda r: envelope(
+            fundamentals([{"date": "2026-12-31", "eps": 9.9}], {"key_metrics": False})
+        )
+    )
+    text = vendor.get_fundamentals("SAP.DE")
+    assert "Key metrics as of: 2026-12-31" in text
+    assert "current values" not in text
+
+
 def test_statements_render_as_line_items_by_period(served):
     served(
         lambda r: envelope(
@@ -306,6 +381,11 @@ def test_refusals_map_to_the_framework_errors(served, status, reason, expected):
     served(lambda r: refusal(status, reason, "register it"))
     with pytest.raises(expected) as raised:
         vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert "the server refused the read" in str(raised.value)
+    if expected is VendorNotConfiguredError:
+        # The reason is the word the CLI turns into a next step, and it is not
+        # the message: it survives only if this branch names it.
+        assert reason in str(raised.value)
     if reason == "subject_out_of_scope":
         assert "register it" in str(raised.value)
 
@@ -322,18 +402,69 @@ def test_a_traded_day_without_a_computed_value_reads_na_not_a_holiday(served):
     assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
 
 
-def test_a_frame_too_short_for_the_200_sma_reports_every_session_it_has(served):
-    # Sixty sessions, far short of the 200-session warm-up. stockstats fills a
-    # moving average from the first row it holds, so these render as values
-    # rather than gaps; what must not happen either way is a day that traded
-    # being reported as a market closure.
+def test_a_frame_too_short_for_the_200_sma_reports_the_gap_not_a_plausible_number(served):
+    # Sixty sessions, far short of the 200 the average needs. stockstats fills
+    # a moving average from the first row it holds, so without the warm-up mask
+    # these render as numbers a reader cannot tell from a real 200 SMA, and the
+    # framework's own yfinance path would answer differently for the same day.
     days = trading_days(date(2026, 9, 8), 60)
     served(lambda r: csv_response(sessions_csv(days)))
     lines = vendor.get_indicators("SAP.DE", "close_200_sma", "2026-09-08", 5).splitlines()
     traded = [line for line in lines if line[:10] in {"2026-09-04", "2026-09-07", "2026-09-08"}]
-    assert len(traded) == 3
-    assert all("Not a trading day" not in line for line in traded)
+    # The render walks the window backwards, newest day first.
+    assert traded == ["2026-09-08: N/A", "2026-09-07: N/A", "2026-09-04: N/A"]
+    # A day that traded is still not a market closure.
     assert "2026-09-05: N/A: Not a trading day (weekend or holiday)" in lines
+
+
+def test_the_first_row_of_the_frame_is_never_a_reported_value(served):
+    # MACD has no single window to warm up, so the mask cannot be sized from
+    # the name. Row 0 is still seeded by one session: stockstats reports 0.0
+    # there, which reads as a settled momentum reading that nothing supports.
+    days = trading_days(date(2026, 9, 8), 3)
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", "macd", "2026-09-08", 6).splitlines()
+    assert "2026-09-04: N/A" in lines
+    assert not any(line.startswith("2026-09-04: 0") for line in lines)
+
+
+def test_a_derived_window_shorter_than_the_frame_still_reports_its_days(served):
+    # The mask must blank the warm-up and nothing beyond it: a 10 EMA over
+    # sixty sessions has every reported day covered.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", "close_10_ema", "2026-09-08", 5).splitlines()
+    traded = [line for line in lines if line[:10] in {"2026-09-04", "2026-09-07", "2026-09-08"}]
+    assert all(": N/A" not in line for line in traded)
+
+
+def test_one_null_volume_among_valid_rows_is_absorbed_by_the_rolling_sums(served):
+    # A characterisation, not an endorsement: stockstats sums volume with
+    # `min_periods=1` (stockstats.py:1130), and a pandas rolling sum skips a
+    # NaN rather than propagating it, so a single missing volume leaves the
+    # VWMA of that day and the thirteen after it computed from a short window
+    # and still printed as a number. Only an entirely null volume column
+    # reaches the N/A branch. The warm-up mask does not reach this class.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days, volumes={59: ""})))
+    lines = vendor.get_indicators("SAP.DE", "vwma", "2026-09-08", 5).splitlines()
+    assert "2026-09-08: 152.1666667" in lines
+    # The same day with every volume present. The gap moves the number rather
+    # than removing it, which is the case this fixture exists to pin.
+    served(lambda r: csv_response(sessions_csv(days)))
+    lines = vendor.get_indicators("SAP.DE", "vwma", "2026-09-08", 5).splitlines()
+    assert "2026-09-08: 152.6666667" in lines
+
+
+def test_a_value_above_a_million_renders_decimal_not_scientific(served):
+    # The framework's yfinance path renders `str(value)`; an exponent here
+    # would read as a different number to an agent comparing the two.
+    days = trading_days(date(2026, 9, 8), 60)
+    served(lambda r: csv_response(sessions_csv(days, base=1234567.0)))
+    text = vendor.get_indicators("SAP.DE", "close_10_ema", "2026-09-08", 3)
+    # `.6g` renders this same value as "1.23462e+06".
+    assert "2026-09-08: 1234622" in text
+    assert "e+" not in text
 
 
 def test_volume_the_server_left_null_reads_na_on_the_days_that_traded(served):
@@ -365,17 +496,44 @@ def test_a_truncated_history_is_declared_above_the_description(served):
     )
 
 
-def test_the_window_covers_the_warm_up_and_a_longer_look_back_is_refused(served):
+def test_the_window_covers_the_warm_up(served):
     days = trading_days(date(2026, 9, 8), 60)
     calls = served(lambda r: csv_response(sessions_csv(days)))
     vendor.get_indicators("SAP.DE", "close_200_sma", "2026-09-08", 30)
     requested = date.fromisoformat(calls[0].url.params["from"])
     assert (date(2026, 9, 8) - requested).days == 30 + vendor.WARMUP_CALENDAR_DAYS
-    with pytest.raises(ValueError) as raised:
-        vendor.get_indicators(
-            "SAP.DE", "close_50_sma", "2026-09-08", vendor.MAX_LOOK_BACK_DAYS + 1
-        )
-    assert "exceeds the history one read can serve" in str(raised.value)
+
+
+def test_a_look_back_longer_than_one_read_is_clamped_not_refused(served):
+    # The look-back is whatever the model asked for, and a year is a normal
+    # ask of a 200 SMA. Raising hands the indicator to the next vendor in the
+    # chain, so one run would mix two price sources; the clamp keeps it here
+    # and says so in the output.
+    days = trading_days(date(2026, 9, 8), 60)
+    calls = served(lambda r: csv_response(sessions_csv(days)))
+    text = vendor.get_indicators("SAP.DE", "close_50_sma", "2026-09-08", 365)
+    clamped = date(2026, 9, 8) - timedelta(days=vendor.MAX_LOOK_BACK_DAYS)
+    assert text.startswith(f"## close_50_sma values from {clamped.isoformat()} to 2026-09-08:")
+    assert vendor.CLAMP_NOTE.format(asked=365, days=vendor.MAX_LOOK_BACK_DAYS) in text
+    requested = date.fromisoformat(calls[0].url.params["from"])
+    assert (date(2026, 9, 8) - requested).days == (
+        vendor.MAX_LOOK_BACK_DAYS + vendor.WARMUP_CALENDAR_DAYS
+    )
+    assert text.rstrip().endswith(vendor.SUPPORTED_INDICATORS["close_50_sma"])
+    # A look-back inside the cap says nothing about a clamp.
+    assert "clamped" not in vendor.get_indicators("SAP.DE", "close_50_sma", "2026-09-08", 30)
+
+
+def test_a_crlf_body_still_finds_the_header_block(served):
+    # The header and the rows are separated by a blank line, which on a CRLF
+    # body is "\r\n\r\n". Split on "\n\n" alone it is never found, the header
+    # block reads empty and the truncation the server declared is never said.
+    days = trading_days(date(2026, 9, 8), 60)
+    body = sessions_csv(days, truncated="true").replace("\n", "\r\n")
+    served(lambda r: csv_response(body))
+    text = vendor.get_indicators("SAP.DE", "close_50_sma", "2026-09-08", 3)
+    assert vendor.TRUNCATION_NOTE in text
+    assert "2026-09-08: " in text
 
 
 def test_a_body_that_is_not_the_csv_never_reaches_the_agents(served):
@@ -395,6 +553,57 @@ def test_the_client_is_rebuilt_when_the_token_has_been_refreshed(served, monkeyp
     vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
     vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
     assert [call.headers["authorization"] for call in calls] == ["Bearer first", "Bearer second"]
+
+
+def test_the_token_is_read_under_the_lock_that_guards_the_client(served, monkeypatch):
+    # Read outside it, two threads interleave and the loser rebuilds the
+    # singleton with the token it read before the refresh, so the next request
+    # carries a dead bearer and the run silently changes vendor. Reading it
+    # under the lock also means one refresh exchange rather than one a thread.
+    held: list[bool] = []
+    served(
+        lambda r: envelope({"subject": {"ticker": "SAP.DE"}, "from": "x", "to": "y", "items": []})
+    )
+
+    def token(*args, **kwargs):
+        held.append(_session._client_lock.locked())
+        return "tok"
+
+    monkeypatch.setattr(_session, "access_token", token)
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert held == [True]
+
+
+def test_a_superseded_client_is_closed_once_nothing_can_still_be_serving_it(served, monkeypatch):
+    served(
+        lambda r: envelope({"subject": {"ticker": "SAP.DE"}, "from": "x", "to": "y", "items": []})
+    )
+    issued = iter(["first", "second", "third"])
+    monkeypatch.setattr(_session, "access_token", lambda *a, **k: next(issued, "third"))
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    first = _session._client_instance
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    second = _session._client_instance
+    # Still open: another thread may have taken it before the rotation and be
+    # mid-request on it.
+    assert second is not first and not first.is_closed
+    vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert first.is_closed and not second.is_closed
+    _session._reset_client()
+    assert second.is_closed
+
+
+def test_a_refusal_without_details_still_names_the_reason(served):
+    served(
+        lambda r: httpx.Response(
+            402,
+            json={"data": None, "error": {"code": "X", "message": "Access is paused"}, "meta": {}},
+        )
+    )
+    with pytest.raises(VendorNotConfiguredError) as raised:
+        vendor.get_news("SAP.DE", "2026-09-01", "2026-09-08")
+    assert "access_paused" in str(raised.value)
+    assert "Access is paused" in str(raised.value)
 
 
 def test_an_unreachable_server_and_a_missing_connection_map_to_the_framework_errors(

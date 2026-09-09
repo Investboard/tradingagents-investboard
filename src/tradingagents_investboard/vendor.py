@@ -26,7 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-from stockstats import wrap
+from stockstats import dft_windows, wrap
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.interface import VENDOR_LIST, VENDOR_METHODS
 
@@ -47,17 +47,25 @@ def _retrieved_on() -> str:
 
 
 def _split_csv(text: str) -> tuple[str, str]:
-    """The header block and the rows, which the blank line separates."""
-    header, separator, body = text.partition("\n\n")
-    return (header, body) if separator else ("", text)
+    """The header block and the rows, which the blank line separates.
+
+    Line endings are normalised first: the separator on a CRLF body is
+    ``\r\n\r\n``, which does not contain ``\n\n`` at all, so splitting on that
+    alone would hand back an empty header block and silence the truncation the
+    server declared in it.
+    """
+    normalised = text.replace("\r\n", "\n")
+    header, separator, body = normalised.partition("\n\n")
+    return (header, body) if separator else ("", normalised)
 
 
 def _parse_csv_header(text: str) -> dict[str, str]:
     """The ``# key: value`` lines the server writes above the rows.
 
-    Read as fields rather than searched for as substrings: ``Total records`` and
-    ``Truncated`` both say something the reader has to act on, and a substring
-    test cannot tell a header line from a value that happens to contain it.
+    Read as fields rather than searched for as substrings: ``Truncated`` says
+    something the reader has to act on, and a substring test cannot tell a
+    header line from a value that happens to contain it. Nothing reads the
+    record count the server also writes here; emptiness is decided by the rows.
     """
     fields: dict[str, str] = {}
     for line in _split_csv(text)[0].splitlines():
@@ -88,7 +96,10 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
 def _frame_from_csv(text: str) -> pd.DataFrame:
     body = _split_csv(text)[1]
     frame = pd.read_csv(io.StringIO(body))
-    frame["Date"] = pd.to_datetime(frame["Date"])
+    # `utc=True` because the window always spans a DST change: offset-bearing
+    # server timestamps would otherwise be mixed offsets, which pandas refuses
+    # with a ValueError that no translation here would catch.
+    frame["Date"] = pd.to_datetime(frame["Date"], utc=True)
     frame = frame.set_index("Date").sort_index()
     frame.columns = [column.lower() for column in frame.columns]
     return frame
@@ -149,19 +160,71 @@ SUPPORTED_INDICATORS = {
     ),
 }
 
-# One read is capped at 400 sessions, about 583 calendar days. The window below
-# is the reported days plus the warm-up the longest supported average (the 200
-# SMA, about 300 calendar days of sessions) needs before the first of them:
-# 275 + 300 = 575 calendar days, inside the cap. Above that the warm-up would be
-# the part the server drops, so the read is refused rather than quietly served
-# with averages computed from a truncated history.
+# One read is capped at 400 sessions. The window is the reported days plus a
+# warm-up ahead of the first of them: 275 + 300 = 575 calendar days. The margins
+# are thin, not comfortable, and they are stated here rather than assumed. On a
+# market printing about 252 sessions a year, 575 calendar days is roughly 395
+# sessions against the 400-row cap, and the 300 warm-up days are roughly 207
+# sessions against the 200 the longest supported average needs. A market
+# printing fewer than about 243 sessions a year runs the warm-up short, and an
+# instrument that trades every day of the week overruns the cap, so the server
+# drops its oldest rows, which are the warm-up. Neither case is refused: the
+# warm-up is blanked instead (`_with_warmup_blanked`), so a shortfall reads as
+# the N/A it is rather than as a number computed from too little history.
 WARMUP_CALENDAR_DAYS = 300
+# The longest look-back one read can warm up. A longer one is clamped to it,
+# not refused: the look-back is model-supplied, and a `ValueError` here is
+# caught by the framework's router as a vendor failure, which hands that one
+# indicator to the next vendor in the chain and mixes two price sources inside
+# a single run.
 MAX_LOOK_BACK_DAYS = 275
 
 TRUNCATION_NOTE = (
     "Note: the price history was truncated to the newest sessions; values at the start of "
     "the window may be incomplete."
 )
+
+CLAMP_NOTE = (
+    "Note: the look-back was clamped from {asked} to {days} days, the longest history one "
+    "read can warm up."
+)
+
+
+def _warmup_rows(indicator: str) -> int | None:
+    """The rows an indicator needs before its first value means anything.
+
+    stockstats encodes the window in the name where the caller chose one
+    (``close_200_sma``), and carries a default for the named ones, which is
+    where ``boll_ub`` gets the 20 of its band. An indicator whose default is
+    several numbers, the MACD triple among them, has no single window, so it
+    gets none rather than a guess.
+    """
+    for segment in indicator.split("_"):
+        if segment.isdigit():
+            return int(segment)
+    for name in (indicator, indicator.rpartition("_")[0]):
+        windows = dft_windows(name) if name else None
+        if windows is not None and windows.isdigit():
+            return int(windows)
+    return None
+
+
+def _with_warmup_blanked(frame: pd.DataFrame, indicator: str) -> pd.Series:
+    """The computed series with the rows that precede its warm-up blanked.
+
+    Every stockstats average fills from the first row it holds
+    (``min_periods=1``), so a frame shorter than the window renders a plausible
+    number where the honest answer is "not known", and the framework's own
+    yfinance path, which loads five years, would answer differently for the
+    same symbol and day. Blanking the first ``window - 1`` rows sends the gap
+    to the N/A branch instead. Row 0 is blanked whatever the indicator, the
+    ones with no derivable window included: it is seeded by a single session,
+    so no reported value may rest on it.
+    """
+    series = frame[indicator].copy()
+    window = _warmup_rows(indicator)
+    series.iloc[: max(window - 1, 1) if window else 1] = float("nan")
+    return series
 
 
 def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: int = 30) -> str:
@@ -170,15 +233,15 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
             f"Indicator {indicator} is not supported. "
             f"Choose from: {', '.join(SUPPORTED_INDICATORS)}"
         )
+    notes: list[str] = []
     if look_back_days > MAX_LOOK_BACK_DAYS:
-        raise ValueError(
-            f"look_back_days above {MAX_LOOK_BACK_DAYS} exceeds the history one read can serve"
-        )
+        notes.append(CLAMP_NOTE.format(asked=look_back_days, days=MAX_LOOK_BACK_DAYS))
+        look_back_days = MAX_LOOK_BACK_DAYS
     end = date.fromisoformat(curr_date)
     start = end - timedelta(days=look_back_days + WARMUP_CALENDAR_DAYS)
     text = get_stock_data(symbol, start.isoformat(), end.isoformat())
     frame = wrap(_frame_from_csv(text))
-    series = frame[indicator]
+    series = _with_warmup_blanked(frame, indicator)
     by_day = {index.date(): value for index, value in series.items()}
     lines = []
     day = end
@@ -192,12 +255,17 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
         elif pd.isna(by_day[day]):
             lines.append(f"{day.isoformat()}: N/A")
         else:
-            lines.append(f"{day.isoformat()}: {float(by_day[day]):.6g}")
+            # `.10g` rather than `.6g`: the framework's own path renders
+            # `str(value)`, and an exponent where it prints digits reads as a
+            # different number to an agent comparing the two.
+            lines.append(f"{day.isoformat()}: {float(by_day[day]):.10g}")
         day -= timedelta(days=1)
     header = f"## {indicator} values from {first.isoformat()} to {curr_date}:"
     description = SUPPORTED_INDICATORS[indicator]
     if _parse_csv_header(text).get("Truncated", "").lower() == "true":
-        description = f"{TRUNCATION_NOTE}\n{description}"
+        notes.append(TRUNCATION_NOTE)
+    if notes:
+        description = "\n".join([*notes, description])
     return f"{header}\n\n" + "\n".join(lines) + f"\n\n{description}"
 
 
@@ -224,17 +292,19 @@ _FUNDAMENTAL_LABELS: tuple[tuple[str, str, str], ...] = (
     ("Free Cash Flow per Share", "key_metrics", "freeCashFlowPerShare"),
 )
 
-# The blocks the server carries undated, so an `asOf` read cannot bound them.
-_CURRENT_VALUE_BLOCKS = ("profile", "ratios_ttm")
-
 
 def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
     data = _call(ticker, lambda c: c.get_fundamentals(ticker, curr_date))
     point_in_time = data.get("point_in_time") or {}
-    # The newest period the server carried, not whatever the list happened to
-    # put first: the order is the server's, and reading position 0 as "latest"
-    # would date the ratios to an older filing without saying so.
+    # The newest period the analysis date could have seen, not whatever the
+    # list happened to put first: the order is the server's, so reading
+    # position 0 as "latest" would date the metrics to an older filing without
+    # saying so, and taking the maximum unbounded would date them to a filing
+    # published after the analysis date, which is look-ahead bias in a
+    # backtest and deterministic rather than incidental.
     periods = data.get("key_metrics") or []
+    if curr_date:
+        periods = [row for row in periods if str(row.get("date") or "")[:10] <= curr_date]
     latest = max(periods, key=lambda row: row.get("date") or "") if periods else {}
     blocks = {
         "profile": data.get("profile") or {},
@@ -255,8 +325,11 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
             continue
         note = ""
         # Say so where the number is today's, so the agent never reads a
-        # current value as the value on the analysis date.
-        if curr_date and block in _CURRENT_VALUE_BLOCKS and not point_in_time.get(block, False):
+        # current value as the value on the analysis date. The server's own
+        # flag decides, block by block: the undated ones (`profile`,
+        # `ratios_ttm`) are the usual case, but a `key_metrics` the server did
+        # not bound is the same claim about a different block.
+        if curr_date and not point_in_time.get(block, False):
             note = f" (current values, not as of {curr_date})"
         lines.append(f"{label}: {value}{note}")
         rendered += 1

@@ -43,6 +43,10 @@ class InvestboardClient:
     def close(self) -> None:
         self._client.close()
 
+    @property
+    def is_closed(self) -> bool:
+        return self._client.is_closed
+
     def _unwrap(self, response: httpx.Response) -> Any:
         try:
             body = response.json()
