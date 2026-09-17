@@ -351,9 +351,7 @@ def _with_warmup_blanked(frame: pd.DataFrame, indicator: str) -> pd.Series:
     return series
 
 
-def _warmup_reached_note(
-    frame: pd.DataFrame, indicator: str, first: date, end: date
-) -> str | None:
+def _warmup_reached_note(frame: pd.DataFrame, indicator: str, first: date, end: date) -> str | None:
     """The note for a warm-up that ran past the history and into the window.
 
     The blanked rows are the oldest the frame holds, so a blanked row dated on
@@ -542,9 +540,7 @@ def get_cashflow(ticker: str, freq: str = "quarterly", curr_date: str | None = N
     return _statement(ticker, "cashflow", freq, curr_date)
 
 
-def get_income_statement(
-    ticker: str, freq: str = "quarterly", curr_date: str | None = None
-) -> str:
+def get_income_statement(ticker: str, freq: str = "quarterly", curr_date: str | None = None) -> str:
     return _statement(ticker, "income", freq, curr_date)
 
 

@@ -149,9 +149,9 @@ def _heuristic_rating(markdown: str) -> str | None:
 
 
 def run_id_for(ticker: str, trade_date: str, started_at: datetime) -> str:
-    digest = hashlib.sha1(
-        f"{ticker}|{trade_date}|{started_at.isoformat()}".encode()
-    ).hexdigest()[:8]
+    digest = hashlib.sha1(f"{ticker}|{trade_date}|{started_at.isoformat()}".encode()).hexdigest()[
+        :8
+    ]
     return f"{ticker}_{trade_date}_{digest}"
 
 

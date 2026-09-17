@@ -257,9 +257,7 @@ def test_a_confidential_client_sends_the_secret_it_was_issued(tmp_path, monkeypa
 
 def test_a_failed_refresh_reads_as_not_connected(tmp_path, monkeypatch):
     """`invalid_grant` is the one refusal `connect` fixes: the token is spent."""
-    _store(
-        tmp_path, monkeypatch, obtained_at=time.time() - 90_000, token_endpoint=TOKEN_ENDPOINT
-    )
+    _store(tmp_path, monkeypatch, obtained_at=time.time() - 90_000, token_endpoint=TOKEN_ENDPOINT)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"error": "invalid_grant"})
@@ -288,9 +286,7 @@ def test_a_refresh_that_got_no_answer_is_not_a_lost_connection(tmp_path, monkeyp
     round trip that cannot fix it, and leaves them believing a connection that
     still works is gone.
     """
-    _store(
-        tmp_path, monkeypatch, obtained_at=time.time() - 90_000, token_endpoint=TOKEN_ENDPOINT
-    )
+    _store(tmp_path, monkeypatch, obtained_at=time.time() - 90_000, token_endpoint=TOKEN_ENDPOINT)
 
     with pytest.raises(RuntimeError) as excinfo:
         auth.access_token(transport=httpx.MockTransport(handler))

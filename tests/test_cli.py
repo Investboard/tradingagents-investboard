@@ -137,9 +137,7 @@ def test_a_failed_post_reports_the_outbox_as_an_error(connected, monkeypatch):
 def test_replay_of_an_empty_outbox_succeeds(monkeypatch):
     import tradingagents_investboard.graph as graph
 
-    monkeypatch.setattr(
-        graph, "replay_outbox", lambda: {"sent": [], "rejected": [], "failed": []}
-    )
+    monkeypatch.setattr(graph, "replay_outbox", lambda: {"sent": [], "rejected": [], "failed": []})
 
     result = runner.invoke(cli.app, ["replay"])
 

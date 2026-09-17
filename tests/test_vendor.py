@@ -200,7 +200,7 @@ def test_fundamentals_render_the_label_lines(served):
                         "debtToEquity": 0.2,
                         "eps": 4.5,
                         "currentRatio": 1.3,
-                    }
+                    },
                 ],
                 "ratios_ttm": {
                     "priceToEarningsRatioTTM": 30.5,
