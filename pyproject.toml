@@ -4,14 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradingagents-investboard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Connect a locally run TradingAgents analysis to your Investboard account"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+keywords = ["tradingagents", "investboard", "portfolio", "investment policy", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 dependencies = [
-    "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@v0.4.0",
+    # TradingAgents itself is NOT declared, on purpose: it is not on PyPI (the
+    # PyPI name `tradingagents` is an unrelated project), and PyPI refuses a
+    # direct Git reference. `_framework.py` checks for it when `analyze` starts.
     # Upper bounds because both are load-bearing wire dependencies: httpx 1.0
     # and mcp 3.0 may move the transport and auth surfaces this package builds on.
     "httpx>=0.27,<1",
@@ -25,6 +36,11 @@ dependencies = [
     "stockstats>=0.6,<1",
     "typer>=0.12",
 ]
+
+[project.urls]
+Homepage = "https://investboard.de"
+Repository = "https://github.com/Investboard/tradingagents-investboard"
+Issues = "https://github.com/Investboard/tradingagents-investboard/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]

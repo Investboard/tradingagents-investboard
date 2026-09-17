@@ -278,3 +278,53 @@ def test_a_second_registration_says_so(connected, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "Registered SAP.DE (already registered)" in result.output
+
+
+def test_analyze_stops_before_any_model_runs_when_the_framework_is_missing(connected, monkeypatch):
+    from tradingagents_investboard import _framework
+
+    monkeypatch.setattr(_framework, "missing", lambda: "TradingAgents is not installed. X")
+
+    result = runner.invoke(cli.app, ["analyze", "SAP.DE"])
+
+    assert result.exit_code == 1
+    assert "Error: TradingAgents is not installed. X" in result.output
+
+
+def test_replay_asks_for_the_framework_too(monkeypatch):
+    # `replay` imports `.graph`, which imports the framework at module scope.
+    from tradingagents_investboard import _framework
+
+    monkeypatch.setattr(_framework, "missing", lambda: "TradingAgents is not installed. X")
+
+    result = runner.invoke(cli.app, ["replay"])
+
+    assert result.exit_code == 1
+    assert "Error: TradingAgents is not installed. X" in result.output
+
+
+def test_status_needs_no_framework(connected, monkeypatch):
+    from tradingagents_investboard import _framework, client
+
+    def boom():
+        raise AssertionError("status must not ask for the framework")
+
+    monkeypatch.setattr(_framework, "require", boom)
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def list_runs(self, ticker):
+            return {"items": []}
+
+        def close(self):
+            pass
+
+    # `status` imports the class inside the function, so the patch is seen.
+    monkeypatch.setattr(client, "InvestboardClient", _Client)
+
+    result = runner.invoke(cli.app, ["status", "SAP.DE"])
+
+    assert result.exit_code == 0
+    assert "No runs stored yet." in result.output
