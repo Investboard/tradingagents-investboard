@@ -16,15 +16,32 @@ one HTTP post at the end of the run.
 - Python 3.10 or newer. Check with `python3 --version`; on macOS, `brew install python@3.12` if
   the system Python is older
 - Your own LLM provider key, the same one TradingAgents already needs
+- TradingAgents v0.4.0, the release this package is tested against
 - An Investboard account
 
 ## Install
+
+You need TradingAgents itself first. It is TauricResearch's framework and is not on PyPI (the PyPI
+project called `tradingagents` is an unrelated one), so it installs from GitHub:
+
+```bash
+pip install git+https://github.com/TauricResearch/TradingAgents.git@v0.4.0
+```
+
+If you already run TradingAgents from a clone, you have it. Then:
+
+```bash
+pip install tradingagents-investboard
+```
+
+Or, from source:
 
 ```bash
 pip install git+https://github.com/Investboard/tradingagents-investboard.git
 ```
 
-The install pulls TradingAgents and LangChain, so it takes a few minutes.
+`connect` and `status` work without the framework; `analyze` and `replay` check for it before they
+start and tell you what to run if it is missing.
 
 ## Connect
 
