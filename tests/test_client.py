@@ -21,9 +21,7 @@ def test_post_run_sends_bearer_and_idempotency_key():
         )
 
     client = make_client(handler)
-    result = client.post_run(
-        {"framework_run_id": "SAP.DE_2026-09-08_abc12345", "ticker": "SAP.DE"}
-    )
+    result = client.post_run({"framework_run_id": "SAP.DE_2026-09-08_abc12345", "ticker": "SAP.DE"})
     assert result == {"id": "r1"}
     assert seen == {
         "auth": "Bearer tok",
@@ -76,9 +74,7 @@ def test_the_ohlcv_read_returns_the_csv_text_and_a_refusal_still_reads_the_envel
         assert request.url.path == "/api/v1/agent/data/ohlcv"
         assert request.url.params["from"] == "2026-06-01"
         if request.url.params["ticker"] == "SAP.DE":
-            return httpx.Response(
-                200, text="# Stock data\n", headers={"content-type": "text/csv"}
-            )
+            return httpx.Response(200, text="# Stock data\n", headers={"content-type": "text/csv"})
         return httpx.Response(
             403,
             json={

@@ -39,9 +39,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAu
 DEFAULT_BASE_URL = "https://app.investboard.de"
 CALLBACK_PORT = 8765
 TOKEN_DIR = Path(
-    os.environ.get(
-        "TRADINGAGENTS_INVESTBOARD_HOME", Path.home() / ".tradingagents" / "investboard"
-    )
+    os.environ.get("TRADINGAGENTS_INVESTBOARD_HOME", Path.home() / ".tradingagents" / "investboard")
 )
 NOT_CONNECTED = "Not connected. Run: tradingagents-investboard connect"
 # A refusal of the connection and a failure to ask are different problems with

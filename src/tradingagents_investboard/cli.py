@@ -113,6 +113,12 @@ def analyze(
     ),
 ) -> None:
     """Run TradingAgents and post the result to Investboard."""
+    from . import _framework
+
+    # Before the token, before the date checks' network reads, before an hour
+    # of model time: `_reported` turns this into one `Error:` line.
+    _framework.require()
+
     from .auth import access_token, base_url
 
     # Resolved per invocation. An option default is evaluated once, when the
@@ -206,6 +212,12 @@ def status(ticker: str = typer.Argument(..., help="Exchange-suffixed ticker")) -
 @_reported
 def replay() -> None:
     """Post runs that failed to reach Investboard."""
+    from . import _framework
+
+    # `.graph` imports the framework at module scope; say what is missing
+    # rather than let that import fail with a bare module name.
+    _framework.require()
+
     from .graph import replay_outbox
 
     outcome = replay_outbox()
