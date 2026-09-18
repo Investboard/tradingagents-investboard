@@ -261,6 +261,13 @@ window and, for a statement, the period, and the answer comes back to your machi
 | `INVESTBOARD_BASE_URL` | `https://app.investboard.de` | Point the client at another environment |
 | `TRADINGAGENTS_INVESTBOARD_HOME` | `~/.tradingagents/investboard` | Where tokens and the outbox live |
 
+## Upstream
+
+The vendor registers itself when this package is imported, so nothing in TradingAgents needs to change
+for it to work. A thin optional shim that registers it automatically when the package is installed is
+proposed upstream as [TauricResearch/TradingAgents#1365](https://github.com/TauricResearch/TradingAgents/pull/1365).
+Whether or not it merges, `analyze` works as described above.
+
 ## Licence
 
 Apache 2.0, see [LICENSE](LICENSE). TradingAgents is Apache 2.0 and belongs to
